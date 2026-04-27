@@ -1,0 +1,25 @@
+# colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# misc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 벤더: 공식 리포를 src에서 직접 clone (이 저장소에는 포함하지 않음)
+src/doosan-robot2/
