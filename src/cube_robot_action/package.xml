@@ -1,17 +1,16 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>cube_robot_action</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="seojunsoo312@gmail.com">junsoo</maintainer>
-  <license>Apache-2.0</license>
-
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
-  <test_depend>python3-pytest</test_depend>
-
+  <version>0.2.0</version>
+  <description>Cube robot action server — TCP 서비스 기반 리팩토링</description>
+  <maintainer email="iys@example.com">iys</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>dsr_msgs2</depend>
+  <depend>cube_interfaces</depend>
+  <depend>std_msgs</depend>
+  <depend>action_msgs</depend>
   <export>
     <build_type>ament_python</build_type>
   </export>
