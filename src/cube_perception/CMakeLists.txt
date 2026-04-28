@@ -27,7 +27,14 @@ install(
 install(PROGRAMS
   scripts/vla_detection_node
   scripts/color_extraction_node
+  scripts/debug_viewer_node
+  scripts/service_tester_gui_node
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_export_dependencies(rosidl_default_runtime)

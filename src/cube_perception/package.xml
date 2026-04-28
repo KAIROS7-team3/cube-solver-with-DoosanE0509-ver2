@@ -3,7 +3,7 @@
 <package format="3">
   <name>cube_perception</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Cube perception package: DetectCubePose and ExtractFace services</description>
   <maintainer email="seojunsoo312@gmail.com">junsoo</maintainer>
   <license>Apache-2.0</license>
 
@@ -16,6 +16,7 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>cv_bridge</depend>
+  <exec_depend>python3-pyqt5</exec_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
