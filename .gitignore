@@ -21,5 +21,10 @@ __pycache__/
 .coverage
 htmlcov/
 
+# secrets / local env (never commit)
+.env
+.env.*
+!.env.example
+
 # 벤더: 공식 리포를 src에서 직접 clone (이 저장소에는 포함하지 않음)
 src/doosan-robot2/
