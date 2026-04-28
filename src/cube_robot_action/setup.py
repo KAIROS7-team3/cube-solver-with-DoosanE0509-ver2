@@ -1,11 +1,11 @@
-from setuptools import find_packages, setup
+from setuptools import setup
 
 package_name = 'cube_robot_action'
 
 setup(
     name=package_name,
-    version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    version='0.2.0',
+    packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -13,17 +13,10 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='junsoo',
-    maintainer_email='seojunsoo312@gmail.com',
-    description='TODO: Package description',
-    license='Apache-2.0',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
     entry_points={
         'console_scripts': [
+            'robot_action_server_node = cube_robot_action.robot_action_server_node:main',
+            'action_client_node       = cube_robot_action.action_client_node:main',
         ],
     },
 )
