@@ -1,3 +1,5 @@
+"""로컬 CV 백엔드 (미구현 시 Gemini 없이 테스트할 자리)."""
+
 from typing import Any, Tuple
 
 import numpy as np
@@ -6,7 +8,7 @@ from .base import CubeDetector
 
 
 class OpenCVDepthDetector(CubeDetector):
-    """OpenCV + depth 기반 큐브 감지 백엔드 스켈레톤."""
+    """RGB·Depth·K 로 큐브 후보 추정 — 추후 contour/ROI 등 붙일 예정."""
 
     def detect(
         self,
@@ -16,14 +18,11 @@ class OpenCVDepthDetector(CubeDetector):
     ) -> Tuple[Any, float]:
         if rgb is None or depth is None or K is None:
             raise ValueError("rgb, depth, K must not be None")
-
         if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError("rgb must be HxWx3 array")
+            raise ValueError("rgb must be HxWx3")
         if depth.ndim != 2:
-            raise ValueError("depth must be HxW array")
+            raise ValueError("depth must be HxW")
         if K.shape != (3, 3):
-            raise ValueError("K must be a 3x3 intrinsic matrix")
+            raise ValueError("K must be 3x3")
 
-        # TODO: 실제 OpenCV 기반 큐브 pose 추정 로직 구현
-        # 반환 타입은 (PoseStamped, confidence)를 따라야 한다.
-        raise NotImplementedError("OpenCVDepthDetector.detect is not implemented yet")
+        raise NotImplementedError("OpenCVDepthDetector.detect not implemented yet")

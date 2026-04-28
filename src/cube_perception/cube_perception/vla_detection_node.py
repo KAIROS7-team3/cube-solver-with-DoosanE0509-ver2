@@ -49,13 +49,7 @@ def _quat_wxyz() -> Tuple[float, float, float, float]:
 
 
 class VlaDetectionNode(Node):
-    """
-    VLA/비전 감지 노드.
-
-    - 카메라 토픽에서 최신 color/depth/camera_info를 받는다. (TetriSpace CubeServiceServer 패턴)
-    - 백엔드(gemini/opencv)는 camera 좌표 3D까지만 추정.
-    - camera -> base_link 는 이 노드에서 T_base_cam 으로 변환. (캘리브 #TODO(tuning) 사용자)
-    """
+    """카메라 구독 → 백엔드 `camera_xyz` → `T_base_cam` 으로 `base` 프레임 PoseStamped 발행."""
 
     def __init__(self) -> None:
         super().__init__("vla_detection_node")
@@ -67,9 +61,6 @@ class VlaDetectionNode(Node):
         self.declare_parameter("color_image_topic", "camera/color/image_raw")
         self.declare_parameter("depth_image_topic", "camera/depth/image_raw")
         self.declare_parameter("camera_info_topic", "camera/color/camera_info")
-        # TODO(tuning): 4x4 T_base_cam (camera -> base_link) 행, row-major 16.
-        # 캘리브로 직접 측정·수정. 단위: m, 동차좌표 [R|t; 0 0 0 1].
-        # 아래는 identity placeholder — 실기동 전에 반드시 교체.
         self.declare_parameter(
             "T_base_cam",
             [
@@ -91,7 +82,6 @@ class VlaDetectionNode(Node):
                 1.0,
             ],
         )
-        # TODO(tuning): world frame for PoseStamped (usually base_link)
         self.declare_parameter("output_frame_id", "base_link")
 
         backend = (
@@ -121,6 +111,10 @@ class VlaDetectionNode(Node):
         self._latest_depth: Optional[np.ndarray] = None
         self._K: Optional[np.ndarray] = None
         self._last_color_stamp: Any = None  # sensor_msgs/Time or None
+        self._latest_top_color: Optional[str] = None
+        self._debug_first_api_pub = self.create_publisher(
+            Image, "/cube_perception/debug/first_api_image", 10
+        )
 
         color_topic = self.get_parameter("color_image_topic").get_parameter_value().string_value
         depth_topic = self.get_parameter("depth_image_topic").get_parameter_value().string_value
@@ -133,9 +127,7 @@ class VlaDetectionNode(Node):
         self._detect_service: Any = None
         if DetectCubePose is None:
             self.get_logger().warning(
-                "DetectCubePose service type not importable. "
-                "Build/install must generate srv Python from cube_perception/srv. "
-                "Service server disabled; camera + backend still used when fixed."
+                "DetectCubePose 타입 로드 실패. colcon build 후 srv 생성 여부 확인."
             )
         else:
             self._detect_service = self.create_service(
@@ -185,7 +177,7 @@ class VlaDetectionNode(Node):
             self.get_logger().warning("info_cb: %s", exc)
 
     def _detect_cb(self, request, response) -> Any:
-        # hint = request.hint
+        _ = request.hint
         if self._latest_bgr is None or self._latest_depth is None or self._K is None:
             response.success = False
             response.message = "Camera frames or camera_info not ready."
@@ -195,13 +187,15 @@ class VlaDetectionNode(Node):
         bgr = self._latest_bgr.copy()
         depth = self._latest_depth.copy()
         K = self._K.copy()
-        # 백엔드는 RGB 기준 (Gemini 인코딩/문서)
+        try:
+            self._debug_first_api_pub.publish(self._bridge.cv2_to_imgmsg(bgr, encoding="bgr8"))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning("debug first_api publish failed: %s", exc)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         if depth.shape[:2] != rgb.shape[:2]:
             response.success = False
             response.message = (
-                f"depth/align mismatch: depth {depth.shape} vs color {rgb.shape[:2]}. "
-                "Use aligned depth or matching topics. # TODO(tuning)"
+                f"depth/color 크기 불일치: depth {depth.shape} vs color {rgb.shape[:2]}"
             )
             response.confidence = 0.0
             return response
@@ -218,6 +212,10 @@ class VlaDetectionNode(Node):
         if isinstance(stub, dict) and "camera_xyz" in stub:
             t = stub["camera_xyz"]
             cam_xyz = (float(t[0]), float(t[1]), float(t[2]))
+            top_color = stub.get("top_color")
+            if isinstance(top_color, str) and top_color in {"W", "R", "G", "Y", "O", "B"}:
+                self._latest_top_color = top_color
+                self.get_logger().info(f"cached top_color={self._latest_top_color}")
         else:
             response.success = False
             response.message = "Backend did not return camera_xyz in stub dict."
