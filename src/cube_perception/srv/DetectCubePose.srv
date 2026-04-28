@@ -1,0 +1,6 @@
+string hint
+---
+geometry_msgs/PoseStamped pose
+float32 confidence
+bool success
+string message
