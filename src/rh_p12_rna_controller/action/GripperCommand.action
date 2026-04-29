@@ -1,0 +1,22 @@
+# GripperCommand.action
+# RH-P12-RN(A) 그리퍼 제어 Action
+# 잡았는지(gripped) 피드백 포함
+
+# ====== Goal ======
+string action           # "open" | "grab_cube" | "grab_rotate" | "grab_repose" | "custom"
+int32 pulse             # action="custom"일 때 목표 pulse (0~1000), 0이면 프리셋 사용
+int32 current           # action="custom"일 때 목표 current (0~1000), 0이면 프리셋 사용
+---
+# ====== Result ======
+bool success            # 동작 자체 성공 여부 (DRL 전송 등)
+bool gripped            # ★ 물체를 잡고 있는지 (전류 + 위치 기반 판정)
+int32 final_position    # 최종 그리퍼 위치 (pulse)
+int32 final_current     # 최종 전류 값
+string message          # 상태 메시지
+---
+# ====== Feedback ======
+string phase            # "sending" | "moving" | "settling" | "checking"
+int32 current_position  # 실시간 위치
+int32 target_position   # 목표 위치
+int32 current_load      # 실시간 전류
+float32 progress        # 0.0 ~ 1.0
