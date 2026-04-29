@@ -1,0 +1,16 @@
+# Goal
+# next_face: 스캔할 면 식별자
+#   "B"       — 카메라 앞 초기 이동 (Cube_scan_B)
+#   "R"       — J6 -90° (R면)
+#   "F"       — J6 -90° (F면)
+#   "L"       — J6 -90° (L면)
+#   "D"       — J6 +270° 복귀 + Cube_scan_D 이동 (D면)
+#   "B_AGAIN" — Cube_scan_B 재이동 (B면 재확인)
+string next_face
+---
+# Result
+bool   success
+string message
+---
+# Feedback
+string stage     # "moving"|"done"

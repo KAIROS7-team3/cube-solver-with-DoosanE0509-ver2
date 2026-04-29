@@ -1,0 +1,9 @@
+# Goal
+# (없음 — 항상 INITIAL_STATE 복귀)
+---
+# Result
+bool   success
+string message
+---
+# Feedback
+string stage          # "moving"|"done"
