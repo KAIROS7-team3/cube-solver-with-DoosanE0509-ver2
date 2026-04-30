@@ -1,20 +1,13 @@
 """
-robot_action_server_node.py
-────────────────────────────
-명세서(cube_solver_node_spec) 3.1 기준 구현.
-
-시나리오: 명령 → 동작 → 완료 리퀘스트 → 확인 → 다음 명령 패턴 반복
-오케스트레이터가 단계별로 액션을 호출하며 각 액션은
-완료 Result를 반환하여 다음 단계 진행 여부를 오케스트레이터가 결정한다.
-
-액션 서버 목록 (명세서 3.1):
-  - ExecuteSolveToken  : 솔빙 토큰 1개 실행
-  - PickupCube         : step 기반 4단계 픽업
-  - PlaceOnJig         : step 기반 2단계 안치
-  - GoHome             : INITIAL_STATE 복귀
-  - RotateCubeForFace  : 면별 단일 동작 스캔
+robot_action_server_node.py — 최종 완성본
+변경사항:
+  - _init_tcp_timer_cb + async _init_tcp 제거
+  - _init_tcp_sync (동기 타이머 콜백) 으로 교체
+  - ConfigCreateTcp weight 필드 제거 (srv에 없음)
+  - TCP_WEIGHT_KG import 제거
 """
 
+import asyncio
 import time
 
 import rclpy
@@ -23,24 +16,17 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from cube_robot_action.action import (
-    ExecuteSolveToken, PickupCube, PlaceOnJig, GoHome, RotateCubeForFace,
-)
+from cube_interfaces.action import CubeMove
 from dsr_msgs2.srv import (
     MoveLine, MoveJoint, MoveStop,
     ConfigCreateTcp, SetCurrentTcp, GetCurrentTcp,
 )
-from dsr_msgs2.srv import DrlStart
 
 from .motion_library import (
     Step, StepKind,
     PULSE_OPEN, PULSE_CUBE,
-    TCP_NAME,
-    JOINT_HOME, ZIG_HOME,
+    TCP_NAME, TCP_POS,
     token_sequence, VALID_TOKENS,
-    pickup_step_seq, PICKUP_STEPS,
-    rotate_face_seq, SCAN_FACES,
-    place_step_seq, PLACE_STEPS,
     VEL_X, VEL_R, ACC_X, ACC_R, VEL_J, ACC_J,
 )
 
@@ -51,274 +37,217 @@ DR_MV_MOD_REL = 1
 
 
 class RobotActionServerNode(Node):
-    """
-    팔+그리퍼 합성 동작 액션 서버 노드. (명세서 3.1)
-    각 액션은 오케스트레이터의 명령에 의해 단계별로 호출되며
-    완료 Result를 반환하여 다음 단계로의 진행을 오케스트레이터가 결정한다.
-    """
 
     def __init__(self):
         super().__init__('robot_action_server_node')
         self.cb_group = ReentrantCallbackGroup()
 
-        self.declare_parameter('robot_ns', '')
-        ns = self.get_parameter('robot_ns').get_parameter_value().string_value
-        _p = f'/{ns}' if ns else ''
-
-        self.movel_cli   = self.create_client(MoveLine,  f'{_p}/motion/move_line',        callback_group=self.cb_group)
-        self.movej_cli   = self.create_client(MoveJoint, f'{_p}/motion/move_joint',       callback_group=self.cb_group)
-        self.stop_cli    = self.create_client(MoveStop,  f'{_p}/motion/move_stop',        callback_group=self.cb_group)
-        self.cfg_tcp_cli = self.create_client(ConfigCreateTcp, f'{_p}/tcp/config_create_tcp', callback_group=self.cb_group)
-        self.set_tcp_cli = self.create_client(SetCurrentTcp,   f'{_p}/tcp/set_current_tcp',   callback_group=self.cb_group)
-        self.get_tcp_cli = self.create_client(GetCurrentTcp,   f'{_p}/tcp/get_current_tcp',   callback_group=self.cb_group)
-        self.drl_cli     = self.create_client(DrlStart,  '/drl/drl_start',                callback_group=self.cb_group)
+        self.movel_cli = self.create_client(
+            MoveLine,  '/motion/move_line',
+            callback_group=self.cb_group)
+        self.movej_cli = self.create_client(
+            MoveJoint, '/motion/move_joint',
+            callback_group=self.cb_group)
+        self.stop_cli = self.create_client(
+            MoveStop,  '/motion/move_stop',
+            callback_group=self.cb_group)
+        self.cfg_tcp_cli = self.create_client(
+            ConfigCreateTcp, '/tcp/config_create_tcp',
+            callback_group=self.cb_group)
+        self.set_tcp_cli = self.create_client(
+            SetCurrentTcp,   '/tcp/set_current_tcp',
+            callback_group=self.cb_group)
+        self.get_tcp_cli = self.create_client(
+            GetCurrentTcp,   '/tcp/get_current_tcp',
+            callback_group=self.cb_group)
 
         self._wait_for_services()
 
-        # 5개 액션 서버 등록 (명세서 3.1)
-        ActionServer(self, ExecuteSolveToken,  'cube_robot_action/execute_solve_token',
-                     execute_callback=self._exec_token_cb,  goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, PickupCube,         'cube_robot_action/pickup_cube',
-                     execute_callback=self._pickup_cb,      goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, PlaceOnJig,         'cube_robot_action/place_on_jig',
-                     execute_callback=self._place_cb,       goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, GoHome,             'cube_robot_action/go_home',
-                     execute_callback=self._home_cb,        goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, RotateCubeForFace,  'cube_robot_action/rotate_cube_for_face',
-                     execute_callback=self._rotate_face_cb, goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
+        self._action_server = ActionServer(
+            self, CubeMove, 'cube_move',
+            execute_callback=self.execute_cb,
+            goal_callback=self.goal_cb,
+            cancel_callback=self.cancel_cb,
+            callback_group=self.cb_group)
 
         self._tcp_ready = False
         self._tcp_timer = self.create_timer(1.5, self._init_tcp_sync)
 
         self.get_logger().info('✅ RobotActionServerNode 초기화 완료')
         self.get_logger().info(f'   유효 토큰: {VALID_TOKENS}')
+        self.get_logger().info('   TCP 초기화 대기 중...')
 
     def _wait_for_services(self):
         for cli, name in [
-            (self.movel_cli,   'move_line'), (self.movej_cli, 'move_joint'),
-            (self.stop_cli,    'move_stop'), (self.drl_cli,   'drl_start'),
+            (self.movel_cli,   '/motion/move_line'),
+            (self.movej_cli,   '/motion/move_joint'),
+            (self.stop_cli,    '/motion/move_stop'),
+            (self.cfg_tcp_cli, '/tcp/config_create_tcp'),
+            (self.set_tcp_cli, '/tcp/set_current_tcp'),
+            (self.get_tcp_cli, '/tcp/get_current_tcp'),
         ]:
             if not cli.wait_for_service(timeout_sec=5.0):
-                self.get_logger().error(f'❌ {name} 없음')
+                self.get_logger().error(f'❌ {name} 서비스 없음')
             else:
                 self.get_logger().info(f'✅ {name} 연결됨')
 
     def _init_tcp_sync(self):
+        """동기 타이머 콜백 — TCP 등록/설정 후 타이머 취소."""
         self._tcp_timer.cancel()
-        try:
-            if self.drl_cli.service_is_ready():
-                req = DrlStart.Request()
-                req.robot_system = 0
-                req.code = f'set_tcp("{TCP_NAME}")'
-                self.drl_cli.call_async(req)
-                self.get_logger().info(f'✅ TCP 설정: {TCP_NAME}')
-        except Exception as e:
-            self.get_logger().warn(f'⚠️ TCP 예외: {e}')
-        self._tcp_ready = True
-        self.get_logger().info('🟢 초기화 완료 — 동작 명령 수신 가능')
+
+        # 1) TCP 프로파일 등록 (name, pos 필드만 존재)
+        if self.cfg_tcp_cli.service_is_ready():
+            req = ConfigCreateTcp.Request()
+            req.name = TCP_NAME
+            req.pos  = [float(v) for v in TCP_POS]
+            future = self.cfg_tcp_cli.call_async(req)
+            rclpy.spin_until_future_complete(self, future)
+            res = future.result()
+            if res and res.success:
+                self.get_logger().info(
+                    f'✅ TCP 프로파일 등록: {TCP_NAME} (Z={TCP_POS[2]}mm)')
+            else:
+                self.get_logger().warn(
+                    '⚠️  TCP 등록 실패 (이미 존재하면 무시)')
+        else:
+            self.get_logger().error('❌ config_create_tcp 서비스 없음')
+
+        # 2) 현재 TCP 설정
+        if self.set_tcp_cli.service_is_ready():
+            req = SetCurrentTcp.Request()
+            req.name = TCP_NAME
+            future = self.set_tcp_cli.call_async(req)
+            rclpy.spin_until_future_complete(self, future)
+            res = future.result()
+            if res and res.success:
+                self.get_logger().info(f'✅ 현재 TCP 설정: {TCP_NAME}')
+                self._tcp_ready = True
+            else:
+                self.get_logger().error('❌ TCP 설정 실패')
+                return
+        else:
+            self.get_logger().error('❌ set_current_tcp 서비스 없음')
+            return
+
+        # 3) 설정 확인
+        if self.get_tcp_cli.service_is_ready():
+            future = self.get_tcp_cli.call_async(GetCurrentTcp.Request())
+            rclpy.spin_until_future_complete(self, future)
+            res = future.result()
+            self.get_logger().info(f'📍 현재 TCP 확인: {res.info}')
+
+        self.get_logger().info('🟢 TCP 초기화 완료 — 동작 명령 수신 가능')
 
     async def _stop_robot(self):
         if self.stop_cli.service_is_ready():
             req = MoveStop.Request()
             req.stop_mode = 1
             await self.stop_cli.call_async(req)
-            self.get_logger().warn('🛑 즉시 정지')
+            self.get_logger().warn('🛑 로봇 즉시 정지 완료')
+        else:
+            self.get_logger().error(
+                '❌ move_stop 없음 — 티치 펜던트 비상 정지 필요!')
 
-    def _goal_cb(self, goal_request):
+    def goal_cb(self, goal_request):
+        token = goal_request.move_token
         if not self._tcp_ready:
+            self.get_logger().error(
+                '❌ TCP 초기화 미완료 — Goal 거부. 잠시 후 다시 시도하세요.')
             return GoalResponse.REJECT
+        if token not in VALID_TOKENS:
+            self.get_logger().warn(f'⚠️  알 수 없는 토큰: {token!r}')
+            return GoalResponse.REJECT
+        self.get_logger().info(f'📥 Goal 수락: {token}')
         return GoalResponse.ACCEPT
 
-    def _cancel_cb(self, goal_handle):
-        self.get_logger().warn('🚨 취소 요청')
+    def cancel_cb(self, goal_handle):
+        self.get_logger().warn('🚨 취소 요청 수신')
         return CancelResponse.ACCEPT
 
-    def _feedback(self, gh, stage: str, progress: float = 0.0):
-        try:
-            fb = gh.action_type.Feedback()
-            if hasattr(fb, 'stage'):   fb.stage    = stage
-            if hasattr(fb, 'progress'): fb.progress = float(progress)
-            gh.publish_feedback(fb)
-        except Exception:
-            pass
+    async def execute_cb(self, goal_handle):
+        token    = goal_handle.request.move_token
+        feedback = CubeMove.Feedback()
+        result   = CubeMove.Result()
+        self.get_logger().info(f'▶ 실행 시작: {token}')
 
-    # ─────────────────────────────────────────────────────
-    # _run_sequence: Step 리스트 순회 (명세서 3.1)
-    # ─────────────────────────────────────────────────────
-    async def _run_sequence(self, gh, steps: list):
+        steps = token_sequence(token)
+        total = len(steps)
+        ok    = await self._run_sequence(goal_handle, steps, feedback, total)
+
+        if ok is None:
+            result.success = False
+            result.message = f'{token} 취소됨'
+            result.steps_executed = feedback.steps_done
+            return result
+        if not ok:
+            result.success = False
+            result.message = f'{token} 실패 @ {feedback.current_step}'
+            result.steps_executed = feedback.steps_done
+            return result
+
+        goal_handle.succeed()
+        result.success = True
+        result.message = f'{token} 완료'
+        result.steps_executed = total
+        self.get_logger().info(f'✅ {token} 완료')
+        return result
+
+    async def _run_sequence(self, goal_handle, steps, feedback, total):
         for i, step in enumerate(steps):
-            if gh.is_cancel_requested:
+            if goal_handle.is_cancel_requested:
+                self.get_logger().warn('🛑 취소 확인 → 즉시 정지')
                 await self._stop_robot()
-                gh.canceled()
+                goal_handle.canceled()
                 return None
-            self.get_logger().info(f'  [{i+1}/{len(steps)}] {step.kind.name}')
-            ok = await self._exec_step(step)
-            if gh.is_cancel_requested:
+
+            feedback.current_step = step.name
+            feedback.steps_done   = i
+            feedback.steps_total  = total
+            goal_handle.publish_feedback(feedback)
+            self.get_logger().info(f'  [{i+1}/{total}] {step.name}')
+
+            coro_task = asyncio.ensure_future(self._exec_step(step))
+            while not coro_task.done():
+                if goal_handle.is_cancel_requested:
+                    self.get_logger().warn(f'🛑 실행 중 취소: {step.name}')
+                    coro_task.cancel()
+                    await self._stop_robot()
+                    goal_handle.canceled()
+                    return None
+                await asyncio.sleep(0.05)
+
+            step_ok = coro_task.result() if not coro_task.cancelled() else False
+            if not step_ok:
+                self.get_logger().error(f'❌ Step 실패: {step.name}')
                 await self._stop_robot()
-                gh.canceled()
-                return None
-            if not ok:
-                await self._stop_robot()
-                gh.abort()
+                goal_handle.abort()
                 return False
+
         return True
 
-    # ─────────────────────────────────────────────────────
-    # ExecuteSolveToken 골 콜백 (명세서 3.1 _exec_token_cb)
-    # ─────────────────────────────────────────────────────
-    async def _exec_token_cb(self, gh):
-        token = gh.request.token
-        self.get_logger().info(f'▶ ExecuteSolveToken: {token}')
-        result = ExecuteSolveToken.Result()
-        if token not in VALID_TOKENS:
-            result.success = False
-            result.message = f'알 수 없는 토큰: {token}'
-            gh.abort()
-            return result
-
-        self._feedback(gh, 'approach', 0.0)
-        steps = [JOINT_HOME()] + token_sequence(token) + [JOINT_HOME()]
-        ok = await self._run_sequence(gh, steps)
-
-        if ok is None:
-            result.success, result.message = False, f'{token} 취소됨'
-        elif not ok:
-            result.success, result.message = False, f'{token} 실패'
-        else:
-            gh.succeed()
-            result.success, result.message = True, f'{token} 완료'
-            self._feedback(gh, 'retreat', 1.0)
-        return result
-
-    # ─────────────────────────────────────────────────────
-    # PickupCube 골 콜백 (명세서 3.1 _pickup_cb)
-    # step: RELEASE_HOME | DESCEND | GRIP | LIFT
-    # DRL 동작 1~6 분배
-    # ─────────────────────────────────────────────────────
-    async def _pickup_cb(self, gh):
-        step = gh.request.step
-        self.get_logger().info(f'▶ PickupCube step: {step}')
-        result = PickupCube.Result()
-
-        if step not in PICKUP_STEPS:
-            result.success = False
-            result.message = f'알 수 없는 step: {step}'
-            gh.abort()
-            return result
-
-        self._feedback(gh, step.lower(), 0.0)
-        steps = pickup_step_seq(step)
-        ok = await self._run_sequence(gh, steps)
-
-        if ok is None:
-            result.success, result.message = False, f'PickupCube {step} 취소됨'
-        elif not ok:
-            result.success, result.message = False, f'PickupCube {step} 실패'
-        else:
-            gh.succeed()
-            result.success, result.message = True, f'PickupCube {step} 완료'
-            self._feedback(gh, step.lower(), 1.0)
-        return result
-
-    # ─────────────────────────────────────────────────────
-    # PlaceOnJig 골 콜백 (명세서 3.1 _place_cb)
-    # step: APPROACH | RELEASE
-    # DRL 동작 14~16 분배
-    # ─────────────────────────────────────────────────────
-    async def _place_cb(self, gh):
-        step = gh.request.step
-        self.get_logger().info(f'▶ PlaceOnJig step: {step}')
-        result = PlaceOnJig.Result()
-
-        if step not in PLACE_STEPS:
-            result.success = False
-            result.message = f'알 수 없는 step: {step}'
-            gh.abort()
-            return result
-
-        self._feedback(gh, step.lower(), 0.0)
-        steps = place_step_seq(step)
-        ok = await self._run_sequence(gh, steps)
-
-        if ok is None:
-            result.success, result.message = False, f'PlaceOnJig {step} 취소됨'
-        elif not ok:
-            result.success, result.message = False, f'PlaceOnJig {step} 실패'
-        else:
-            gh.succeed()
-            result.success, result.message = True, f'PlaceOnJig {step} 완료'
-            self._feedback(gh, step.lower(), 1.0)
-        return result
-
-    # ─────────────────────────────────────────────────────
-    # GoHome 골 콜백 (명세서 3.1 _home_cb)
-    # ─────────────────────────────────────────────────────
-    async def _home_cb(self, gh):
-        self.get_logger().info('▶ GoHome')
-        result = GoHome.Result()
-        self._feedback(gh, 'moving', 0.0)
-        ok = await self._run_sequence(gh, [JOINT_HOME(), ZIG_HOME(), JOINT_HOME()])
-        if ok is None:
-            result.success, result.message = False, 'GoHome 취소됨'
-        elif not ok:
-            result.success, result.message = False, 'GoHome 실패'
-        else:
-            gh.succeed()
-            result.success, result.message = True, 'GoHome 완료'
-            self._feedback(gh, 'done', 1.0)
-        return result
-
-    # ─────────────────────────────────────────────────────
-    # RotateCubeForFace 골 콜백 (명세서 3.1 _rotate_face_cb)
-    # next_face: B | R | F | L | D | B_AGAIN
-    # DRL 동작 7~13 분배
-    # ─────────────────────────────────────────────────────
-    async def _rotate_face_cb(self, gh):
-        next_face = gh.request.next_face
-        self.get_logger().info(f'▶ RotateCubeForFace: {next_face}')
-        result = RotateCubeForFace.Result()
-
-        if next_face not in SCAN_FACES:
-            result.success = False
-            gh.abort()
-            return result
-
-        self._feedback(gh, 'moving', 0.0)
-        steps = rotate_face_seq(next_face)
-        ok = await self._run_sequence(gh, steps)
-
-        if ok is None:
-            result.success = False
-        elif not ok:
-            result.success = False
-        else:
-            gh.succeed()
-            result.success = True
-            self._feedback(gh, 'done', 1.0)
-        return result
-
-    # ─────────────────────────────────────────────────────
-    # Step 실행
-    # ─────────────────────────────────────────────────────
     async def _exec_step(self, step: Step) -> bool:
         if step.kind == StepKind.MOVE_L_ABS:
-            return await self._movel(step, DR_MV_MOD_ABS)
+            return await self._movel(step, mode=DR_MV_MOD_ABS)
         elif step.kind == StepKind.MOVE_L_REL:
-            return await self._movel(step, DR_MV_MOD_REL)
-        elif step.kind in (StepKind.MOVE_J_ABS, StepKind.MOVE_J_REL):
+            return await self._movel(step, mode=DR_MV_MOD_REL)
+        elif step.kind == StepKind.MOVE_J_REL:
             return await self._movej(step)
         elif step.kind == StepKind.GRIP:
             return await self._grip(step)
         elif step.kind == StepKind.WAIT:
             time.sleep(step.sec or 0.5)
             return True
-        return False
+        else:
+            self.get_logger().error(f'알 수 없는 StepKind: {step.kind}')
+            return False
 
     async def _movel(self, step: Step, mode: int) -> bool:
         pos = step.pose
         if mode == DR_MV_MOD_ABS and pos[2] < Z_SAFE_LIMIT:
-            self.get_logger().error(f'🚨 Z 안전 한계 초과: {pos[2]:.1f}mm')
+            self.get_logger().error(
+                f'🚨 Z 안전 한계 초과! Z={pos[2]:.1f}mm → 차단: {step.name}')
             return False
+
         req = MoveLine.Request()
         req.pos        = [float(p) for p in pos]
         req.vel        = [step.vel or VEL_X, step.acc or VEL_R]
@@ -340,7 +269,7 @@ class RobotActionServerNode(Node):
         req.acc        = step.acc or ACC_J
         req.time       = 0.0
         req.radius     = 0.0
-        req.mode       = DR_MV_MOD_ABS if step.kind == StepKind.MOVE_J_ABS else DR_MV_MOD_REL
+        req.mode       = DR_MV_MOD_REL
         req.blend_type = 0
         req.sync_type  = 0
         res = await self.movej_cli.call_async(req)
@@ -349,7 +278,8 @@ class RobotActionServerNode(Node):
 
     async def _grip(self, step: Step) -> bool:
         pulse = step.pulse
-        self.get_logger().info(f'  🤖 gripper {"OPEN" if pulse == PULSE_OPEN else "CLOSE"} (pulse={pulse})')
+        label = 'OPEN' if pulse == PULSE_OPEN else 'CLOSE'
+        self.get_logger().info(f'  🤖 gripper {label} (pulse={pulse})')
         time.sleep(0.5)
         return True
 
