@@ -101,6 +101,30 @@ sequenceDiagram
   N-->>C: Result + Feedback
 ```
 
+### 4) TCP 통신 데이터 흐름 (ROS 노드/DRL/TCP/Gripper)
+
+```mermaid
+flowchart LR
+  subgraph ROS["ROS 2 노드: gripper_node"]
+    AS["ActionServer(GripperCommand)"]
+    ST["Publisher /gripper/state (JointState, state_hz)"]
+    RX["TCP recv thread -> last state cache"]
+  end
+
+  subgraph CTRL["Doosan Controller (DRL)"]
+    TS["Pure python TCP server in DRL\n(JSON framed state/ack)"]
+    MB["flange_serial_* + Modbus"]
+  end
+
+  G["RH-P12-RN (Modbus)"]
+
+  U["User / higher-level node"] -->|"action goal"| AS
+  ROS -->|"DrlStart inject"| TS
+  ROS <-->|"TCP client"| TS
+  TS <-->|"Modbus"| G
+  RX --> ST
+```
+
 ---
 
 ## 실행 명령어 정리
