@@ -1,3 +1,4 @@
+import json
 from typing import Dict, Optional
 
 import cv2
@@ -7,10 +8,11 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from cube_perception.srv import DetectCubePose, ExtractFace
+from cube_perception.srv import DetectCubePose, ExtractFace, GetCubeState
 
 
 class ServiceTesterNode(Node):
@@ -22,9 +24,12 @@ class ServiceTesterNode(Node):
         self._latest_color: Optional[np.ndarray] = None
         self._first_api: Optional[np.ndarray] = None
         self._faces: Dict[str, Optional[np.ndarray]] = {"B": None, "R": None, "F": None, "L": None, "D": None}
+        self._u_face_9: Optional[str] = None
+        self._u_top_color: Optional[str] = None
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Image, color_image_topic, self._color_cb, qos)
+        self.create_subscription(String, "/cube_perception/u_face_cache", self._u_cache_cb, 10)
         self.create_subscription(Image, "/cube_perception/debug/first_api_image", self._first_cb, 10)
         self.create_subscription(Image, "/cube_perception/debug/face_B", self._face_cb_factory("B"), 10)
         self.create_subscription(Image, "/cube_perception/debug/face_R", self._face_cb_factory("R"), 10)
@@ -34,6 +39,9 @@ class ServiceTesterNode(Node):
 
         self.detect_client = self.create_client(DetectCubePose, "/detect_cube_pose")
         self.extract_client = self.create_client(ExtractFace, "/color_extraction_node/extract_face")
+        self.get_state_client = self.create_client(
+            GetCubeState, "/color_extraction_node/get_cube_state"
+        )
 
     def _to_bgr(self, msg: Image) -> np.ndarray:
         if msg.encoding == "bgr8":
@@ -63,6 +71,18 @@ class ServiceTesterNode(Node):
                 pass
 
         return _cb
+
+    def _u_cache_cb(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+            top_face_9 = str(data.get("top_face_9", "")).strip().upper()
+            top_color = str(data.get("top_color", "")).strip().upper()
+            if len(top_face_9) == 9 and all(c in {"W", "R", "G", "Y", "O", "B"} for c in top_face_9):
+                self._u_face_9 = top_face_9
+            if top_color in {"W", "R", "G", "Y", "O", "B"}:
+                self._u_top_color = top_color
+        except Exception:
+            pass
 
 
 class ServiceTesterWindow(QtWidgets.QWidget):
@@ -96,14 +116,19 @@ class ServiceTesterWindow(QtWidgets.QWidget):
         self.btn_detect.clicked.connect(self.on_detect_clicked)
         btn_row.addWidget(self.btn_detect)
 
-        for face in ["B", "R", "F", "L", "D", "U"]:
+        for face in ["B", "R", "F", "L", "D"]:
             b = QtWidgets.QPushButton(f"ExtractFace {face}")
             b.clicked.connect(lambda _checked=False, f=face: self.on_extract_clicked(f))
             btn_row.addWidget(b)
+        self.btn_get_state = QtWidgets.QPushButton("GetCubeState 호출")
+        self.btn_get_state.clicked.connect(self.on_get_state_clicked)
+        btn_row.addWidget(self.btn_get_state)
         root.addLayout(btn_row)
 
         self.status_label = QtWidgets.QLabel("상태: 준비")
         root.addWidget(self.status_label)
+        self.u_cache_label = QtWidgets.QLabel("U 캐시: N/A")
+        root.addWidget(self.u_cache_label)
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -153,6 +178,9 @@ class ServiceTesterWindow(QtWidgets.QWidget):
         self._set_thumb("F", self.node._faces["F"])
         self._set_thumb("L", self.node._faces["L"])
         self._set_thumb("D", self.node._faces["D"])
+        u_txt = self.node._u_face_9 if self.node._u_face_9 is not None else "N/A"
+        c_txt = self.node._u_top_color if self.node._u_top_color is not None else "N/A"
+        self.u_cache_label.setText(f"U 캐시: {u_txt} (center={c_txt})")
 
     def on_detect_clicked(self) -> None:
         if not self.node.detect_client.wait_for_service(timeout_sec=0.2):
@@ -199,6 +227,29 @@ class ServiceTesterWindow(QtWidgets.QWidget):
         except Exception as exc:  # noqa: BLE001
             self.status_label.setText(f"상태: Extract {face} 실패")
             self.log_line(f"[Extract-{face}] exception: {exc}")
+
+    def on_get_state_clicked(self) -> None:
+        if not self.node.get_state_client.wait_for_service(timeout_sec=0.2):
+            self.status_label.setText("상태: /get_cube_state 서비스 없음")
+            self.log_line("[GetCubeState] service unavailable")
+            return
+        req = GetCubeState.Request()
+        future = self.node.get_state_client.call_async(req)
+        future.add_done_callback(self._on_get_state_done)
+        self.status_label.setText("상태: GetCubeState 요청 중...")
+        self.log_line("[GetCubeState] request sent")
+
+    def _on_get_state_done(self, future) -> None:
+        try:
+            resp = future.result()
+            self.status_label.setText(f"상태: GetCubeState done (success={resp.success})")
+            self.log_line(
+                f"[GetCubeState] success={resp.success} state_54='{resp.state_54}' "
+                f"faces_json='{resp.faces_json}' msg={resp.message}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText("상태: GetCubeState 실패")
+            self.log_line(f"[GetCubeState] exception: {exc}")
 
 
 def main() -> None:

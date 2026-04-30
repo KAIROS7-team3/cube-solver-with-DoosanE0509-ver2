@@ -1,24 +1,46 @@
-# cube_perception 테스트 가이드
+# cube_perception
 
-다른 팀원이 이 노트북에서 `cube_perception` 패키지만 단독 테스트할 때 쓰는 최소 절차입니다.
+`cube_perception`은 `cube_orchestrator`가 호출하는 서비스 패키지입니다.
+이번 리팩터링 기준으로 책임이 아래처럼 분리됩니다.
 
-## 0) 사전 조건
+## 구성 요소 역할
 
-- ROS2 Humble 설치
-- 카메라 토픽 수신 가능
-  - `camera/color/image_raw`
-  - `camera/depth/image_raw`
-  - `camera/color/camera_info`
-- Gemini API 키 설정 (`.env`)
+- `vla_detection_node.py`
+  - `DetectCubePose` 서비스 서버
+  - RGB/Depth/K를 받아 1차 Gemini 호출 + depth backend 계산 + 최종 `PoseStamped(base_link)` 조립
+  - 첫 호출에서 얻은 `top_face_9`를 `/cube_perception/u_face_cache`로 publish
+- `gemini_vla_backend.py`
+  - 2D 감지 전용
+  - 출력: `pixel_uv`, `top_color`, `top_face_9`
+- `opencv_depth_backend.py`
+  - depth/3D 계산 전용
+  - 입력: `pixel_uv`, `depth`, `K`, `T_base_cam`
+  - 출력: `depth_m`, `camera_xyz`, `base_xyz`
+- `color_extraction_node.py`
+  - `ExtractFace`(캡처 ACK) + `GetCubeState`(최종 상태 반환) 서비스 서버
+  - `ExtractFace`: `B/R/F/L/D` 캡처/저장만 담당
+  - `GetCubeState`: U 캐시 + 5면 추정 결과를 합쳐 `state_54` 반환
+- `debug_viewer_node.py`
+  - 라이브 카메라/디버그 썸네일/`U` 캐시 텍스트 모니터링
+- `service_tester_gui_node.py`
+  - PyQt 기반 서비스 테스트 GUI
+  - `DetectCubePose`, `ExtractFace`, `GetCubeState` 호출 + 디버그 이미지 + `U` 캐시 표시
 
-예시 `.env`:
+## 사전 조건
+
+- ROS 2 Humble
+- 카메라 토픽
+  - `/camera/camera/color/image_raw`
+  - `/camera/camera/aligned_depth_to_color/image_raw`
+  - `/camera/camera/color/camera_info`
+- `.env` 설정
 
 ```bash
 GEMINI_API_KEY=YOUR_API_KEY
 GEMINI_MODEL=gemini-robotics-er-1.6-preview
 ```
 
-## 1) 빌드
+## 빌드
 
 ```bash
 cd ~/cube_solver_ver2_ws
@@ -27,145 +49,77 @@ colcon build --symlink-install --packages-select cube_perception
 source install/setup.bash
 ```
 
-## 2) 노드 실행 (터미널 역할 포함)
+## 실행 과정
 
-### 터미널 A: 1차 감지 노드 (`vla_detection_node`)
-
-- 역할: `DetectCubePose` 서비스 서버
-- 입력: color/depth/camera_info 토픽
-- 출력: 큐브 3D pose + confidence (`/detect_cube_pose`)
-- 참고: 내부적으로 상단면 색(`top_color`)은 캐시만 하고 서비스 응답에는 포함하지 않음
+### 1) perception 스택 실행
 
 ```bash
-cd ~/cube_solver_ver2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 run cube_perception vla_detection_node --ros-args -p detector_backend:=gemini
-```
-
-### 터미널 B: 2차 색 추출 노드 (`color_extraction_node`)
-
-- 역할: `ExtractFace` 서비스 서버
-- 입력: color 토픽 + face 요청(U/D/R/L/F/B)
-- 출력: 요청 면의 `colors_9` (`/color_extraction_node/extract_face`)
-- 참고: B/R/F/L/D 프레임 누적 후 Gemini state 추정을 수행
-
-```bash
-cd ~/cube_solver_ver2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 run cube_perception color_extraction_node
-```
-
-### 터미널 C: 서비스 호출/검증용
-
-- 역할: 테스트 클라이언트 전용
-- 용도: 서비스 호출, 토픽/서비스 상태 점검
-
-### 터미널 D: 상태 점검용 (선택)
-
-- 역할: 노드/서비스/토픽 활성화 확인
-- 용도: 문제 발생 시 원인 분리 (노드 미기동 vs 카메라 미기동)
-
-## 3) 실행 확인 (터미널 D에서 실행)
-
-```bash
-ros2 node list | grep -E "vla_detection_node|color_extraction_node"
-ros2 service list | grep -E "detect_cube_pose|extract_face"
-ros2 topic list | grep -E "camera/color/image_raw|camera/depth/image_raw|camera/color/camera_info"
-```
-
-`ros2 run ...` 실행 후 프롬프트가 멈춘 것처럼 보이는 것은 정상입니다.  
-노드가 foreground에서 요청 대기 중인 상태입니다.
-
-## 4) 서비스 호출 테스트 (터미널 C에서 실행)
-
-### 4-1. 큐브 좌표 요청 (1차)
-
-```bash
-ros2 service call /detect_cube_pose cube_perception/srv/DetectCubePose "{hint: ''}"
-```
-
-정상 시 `success: true`, `pose`, `confidence`가 반환됩니다.
-
-### 4-2. 면 색 요청 (2차)
-
-아래처럼 B/R/F/L/D를 먼저 한 번씩 호출한 뒤 원하는 면을 조회하는 것을 권장합니다.
-
-```bash
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'B'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'R'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'F'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'L'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'D'}"
-```
-
-- 요청 가능한 face: `U D R L F B`
-- 현재 구현은 `B/R/F/L/D` 이미지가 누적되어야 상태 추정이 성공합니다.
-- 누적 전에는 `success: false`와 함께 `missing` 안내 메시지가 나올 수 있습니다.
-
-## 5) 빠른 점검 명령
-
-```bash
-ros2 service list | grep -E "detect_cube_pose|extract_face"
-ros2 topic list | grep -E "camera/color/image_raw|camera/depth/image_raw|camera/color/camera_info"
-```
-
-## 6) 자주 발생하는 문제
-
-- `GEMINI_API_KEY is not set`
-  - `.env` 확인, 노드 재실행
-- `Camera frames or camera_info not ready`
-  - 카메라 드라이버/토픽 확인
-- `depth/color 크기 불일치`
-  - aligned depth 토픽 사용 또는 토픽 remap 필요
-- `extract failed: state estimation failed ...`
-  - B/R/F/L/D 호출 누락 여부 확인 후 다시 호출
-
-## 7) 완전 처음부터 실행 (초간단)
-
-### 터미널 A: RealSense
-```bash
-source /opt/ros/humble/setup.bash
-ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
-```
-
-### 터미널 B: perception 스택(노드 2개 동시 실행)
-```bash
-cd ~/cube_solver_ver2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select cube_perception
-source install/setup.bash
 ros2 launch cube_perception perception_stack.launch.py \
-  use_realsense:=false \
+  use_realsense:=true \
   color_image_topic:=/camera/camera/color/image_raw \
   depth_image_topic:=/camera/camera/aligned_depth_to_color/image_raw \
-  camera_info_topic:=/camera/camera/color/camera_info
+  camera_info_topic:=/camera/camera/color/camera_info \
+  depth_unit_scale:=0.001 \
+  depth_sample_radius_px:=2
 ```
 
-### 터미널 C: 서비스 테스트
-```bash
-source /opt/ros/humble/setup.bash
-source ~/cube_solver_ver2_ws/install/setup.bash
+`use_realsense:=true`로 주면 RealSense 런치를 함께 실행합니다.
 
+### 2) 서비스 호출 순서
+
+1. 1차 호출 (`DetectCubePose`)
+   - 내부에서 `pixel_uv + top_face_9` 확보
+   - 동시에 `opencv_depth_backend`로 3D/base 계산
+2. 캡처 호출 (`ExtractFace`) 5회
+   - `B/R/F/L/D` 순서로 캡처 ACK만 수행 (`success=true`, `colors_9` 비움)
+3. 상태 조회 (`GetCubeState`) 1회
+   - 여기서 Gemini 2차 추정 실행 후 U 캐시와 결합한 `state_54` 수신
+
+CLI 예시:
+
+```bash
 # 1차 API
 ros2 service call /detect_cube_pose cube_perception/srv/DetectCubePose "{hint: ''}"
 
-# 2차 API (B/R/F/L/D 순으로 1번씩)
+# 2차 API (면 캡처 ACK: B/R/F/L/D)
 ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'B'}"
 ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'R'}"
 ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'F'}"
 ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'L'}"
 ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'D'}"
+
+# 3차 API (최종 상태 조회)
+ros2 service call /color_extraction_node/get_cube_state cube_perception/srv/GetCubeState "{}"
 ```
 
-선택(디버그 GUI):
+## 디버그/테스트 도구
+
+- OpenCV viewer
 ```bash
 ros2 run cube_perception debug_viewer_node --ros-args -p color_image_topic:=/camera/camera/color/image_raw
 ```
 
-선택(PyQt 클릭형 서비스 테스트 GUI):
+- PyQt 서비스 테스트 GUI
 ```bash
 ros2 run cube_perception service_tester_gui_node --color-image-topic /camera/camera/color/image_raw
 ```
+
+## 점검 명령
+
+```bash
+ros2 node list | rg "vla_detection_node|color_extraction_node|cube_perception_debug_viewer"
+ros2 service list | rg "detect_cube_pose|extract_face|get_cube_state"
+ros2 topic echo /cube_perception/u_face_cache --once
+```
+
+## 트러블슈팅
+
+- `GEMINI_API_KEY is not set`
+  - `.env` 확인 후 노드 재실행
+- `Camera frames or camera_info not ready`
+  - 카메라 드라이버/토픽 확인
+- `depth/color 크기 불일치`
+  - aligned depth 토픽 사용 확인
+- `GetCubeState`가 U 캐시 없음으로 실패
+  - 먼저 `/detect_cube_pose`를 1회 호출했는지 확인
 

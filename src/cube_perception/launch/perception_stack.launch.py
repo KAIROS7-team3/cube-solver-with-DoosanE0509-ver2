@@ -11,10 +11,11 @@ import os
 
 def generate_launch_description() -> LaunchDescription:
     use_realsense = LaunchConfiguration("use_realsense")
-    detector_backend = LaunchConfiguration("detector_backend")
     color_image_topic = LaunchConfiguration("color_image_topic")
     depth_image_topic = LaunchConfiguration("depth_image_topic")
     camera_info_topic = LaunchConfiguration("camera_info_topic")
+    depth_unit_scale = LaunchConfiguration("depth_unit_scale")
+    depth_sample_radius_px = LaunchConfiguration("depth_sample_radius_px")
 
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -34,10 +35,11 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
         parameters=[
             {
-                "detector_backend": detector_backend,
                 "color_image_topic": color_image_topic,
                 "depth_image_topic": depth_image_topic,
                 "camera_info_topic": camera_info_topic,
+                "depth_unit_scale": depth_unit_scale,
+                "depth_sample_radius_px": depth_sample_radius_px,
             }
         ],
     )
@@ -52,7 +54,6 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("use_realsense", default_value="true"),
-            DeclareLaunchArgument("detector_backend", default_value="gemini"),
             DeclareLaunchArgument(
                 "color_image_topic", default_value="/camera/camera/color/image_raw"
             ),
@@ -63,6 +64,8 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "camera_info_topic", default_value="/camera/camera/color/camera_info"
             ),
+            DeclareLaunchArgument("depth_unit_scale", default_value="0.001"),
+            DeclareLaunchArgument("depth_sample_radius_px", default_value="2"),
             realsense_launch,
             vla_node,
             color_node,

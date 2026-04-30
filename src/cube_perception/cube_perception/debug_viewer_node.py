@@ -1,3 +1,4 @@
+import json
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -7,6 +8,7 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 
 class DebugViewerNode(Node):
@@ -23,10 +25,13 @@ class DebugViewerNode(Node):
         self._latest_color: Optional[np.ndarray] = None
         self._first_api: Optional[np.ndarray] = None
         self._faces: Dict[str, Optional[np.ndarray]] = {"B": None, "R": None, "F": None, "L": None, "D": None}
+        self._u_face_9: Optional[str] = None
+        self._u_top_color: Optional[str] = None
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         color_topic = self.get_parameter("color_image_topic").get_parameter_value().string_value
         self.create_subscription(Image, color_topic, self._color_cb, qos)
+        self.create_subscription(String, "/cube_perception/u_face_cache", self._u_cache_cb, 10)
         self.create_subscription(Image, "/cube_perception/debug/first_api_image", self._first_cb, 10)
         self.create_subscription(Image, "/cube_perception/debug/face_B", self._face_cb_factory("B"), 10)
         self.create_subscription(Image, "/cube_perception/debug/face_R", self._face_cb_factory("R"), 10)
@@ -66,6 +71,18 @@ class DebugViewerNode(Node):
 
         return _cb
 
+    def _u_cache_cb(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+            top_face_9 = str(data.get("top_face_9", "")).strip().upper()
+            top_color = str(data.get("top_color", "")).strip().upper()
+            if len(top_face_9) == 9 and all(c in {"W", "R", "G", "Y", "O", "B"} for c in top_face_9):
+                self._u_face_9 = top_face_9
+            if top_color in {"W", "R", "G", "Y", "O", "B"}:
+                self._u_top_color = top_color
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning("u cache decode failed: %s", exc)
+
     def _thumb_or_blank(self, img: Optional[np.ndarray], label: str, size: Tuple[int, int]) -> np.ndarray:
         w, h = size
         if img is None:
@@ -85,6 +102,17 @@ class DebugViewerNode(Node):
         top_w = 960
         top = cv2.resize(self._latest_color, (top_w, top_h), interpolation=cv2.INTER_AREA)
         cv2.putText(top, "LIVE CAMERA", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        u_text = self._u_face_9 if self._u_face_9 is not None else "N/A"
+        c_text = self._u_top_color if self._u_top_color is not None else "N/A"
+        cv2.putText(
+            top,
+            f"U cache: {u_text} (center={c_text})",
+            (10, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 255, 255),
+            2,
+        )
 
         thumb_w, thumb_h = 160, 120
         thumbs: List[np.ndarray] = [

@@ -1,3 +1,14 @@
+"""Detection 계층 공통 인터페이스.
+
+이 파일은 `cube_perception`의 감지 계층 계약을 정의한다.
+- `GeminiVLADetector`: 2D 위치 + U면 시각 정보 추출
+- `OpenCVDepthDetector`: depth 기반 3D/base 좌표 계산
+
+주의:
+- 현재 리팩터링 구조에서 `detect()`는 주로 Gemini 경로에서 사용된다.
+- OpenCV depth 계산은 `compute_from_pixel()`로 분리되어 호출된다.
+"""
+
 from abc import ABC, abstractmethod
 from typing import Any, Tuple
 
