@@ -206,8 +206,26 @@ class RobotActionServerNode(Node):
             gh.abort()
             return result
 
+        # cube_pose XY 좌표 추출 (m → mm 변환)
+        # cube_pose가 (0,0)이면 ZIG Home 기준 동작 (임시 픽업)
+        # cube_pose XY 값이 있으면 워크스테이션 랜덤 위치 픽업
+        cube_x, cube_y = None, None
+        try:
+            pose = gh.request.cube_pose.pose
+            if pose.position.x != 0.0 or pose.position.y != 0.0:
+                cube_x = pose.position.x * 1000.0  # m → mm
+                cube_y = pose.position.y * 1000.0  # m → mm
+                self.get_logger().info(
+                    f'  cube_pose 수신: x={cube_x:.1f}mm y={cube_y:.1f}mm'
+                    f' → 워크스테이션 랜덤 위치 픽업')
+            else:
+                self.get_logger().info(
+                    '  cube_pose 없음(0,0) → ZIG Home 기준 임시 픽업')
+        except Exception as e:
+            self.get_logger().warn(f'  cube_pose 파싱 실패({e}) → ZIG Home 기준')
+
         self._feedback(gh, step.lower(), 0.0)
-        steps = pickup_step_seq(step)
+        steps = pickup_step_seq(step, cube_x, cube_y)
         ok = await self._run_sequence(gh, steps)
 
         if ok is None:

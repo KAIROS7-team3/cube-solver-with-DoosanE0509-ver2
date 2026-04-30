@@ -86,6 +86,10 @@ PULSE_REPOSE: int = 420
 # ZIG 위치 (INITIAL_STATE) — 큐브 안치 기준점
 INITIAL_STATE: list = [373.030,   0.000,  74.660, 22.85, -180.0,  22.85]
 
+# 워크스테이션 큐브 파지 Z 고정값 (큐브인식모션테스트.tw 실측값)
+# 워크스테이션 바닥이 평평하므로 XY 위치와 무관하게 항상 동일한 Z에서 파지
+WORKSTATION_GRIP_Z: float = 13.71   # mm
+
 # 솔빙 동작용 드롭 위치
 L_DROP_POS:    list = [373.030,   0.000,  48.530, 90.0,    90.0,  90.0 ]
 R_DROP_POS:    list = [373.030,   0.000,  48.530, 90.0,   -90.0,  90.0 ]
@@ -154,14 +158,24 @@ J6_CCW     = lambda: mj_rel([0, 0, 0, 0, 0, -90])
 # 오케스트레이터가 단계별로 호출 — 명령→동작→완료 패턴
 # ═══════════════════════════════════════════════════════════
 
-def pickup_step_seq(step: str) -> list:
+def pickup_step_seq(step: str,
+                    cube_x: float = None,
+                    cube_y: float = None) -> list:
     """
     PickupCube 단계별 시퀀스.
     step: "RELEASE_HOME" | "DESCEND" | "GRIP" | "LIFT"
 
+    cube_x, cube_y: cube_perception DetectCubePose가 반환한 XY 좌표 (mm)
+      - None → ZIG Home 기준 임시 픽업 (cube_perception 연동 전 테스트용)
+      - 값 있음 → 워크스테이션 랜덤 위치 픽업
+
     DRL 동작 1~6 분배:
       RELEASE_HOME → DRL 동작 1(gripper_release) + 동작 2(movej Home)
-      DESCEND      → DRL 동작 3(movel ZIG) + 동작 4(movel Z-30mm)
+      DESCEND      →
+        [ZIG 모드]  DRL 동작 3(movel ZIG) + 동작 4(movel Z-30mm)
+        [랜덤 모드] cube_pose XY + INITIAL_STATE Z로 수평 이동
+                   → WORKSTATION_GRIP_Z(13.71mm)까지 수직 하강
+                   하강량 = -(INITIAL_STATE[2] - WORKSTATION_GRIP_Z) = -60.95mm
       GRIP         → DRL 동작 5(gripper_grap)
       LIFT         → DRL 동작 6(movel Z+40mm)
     """
@@ -172,11 +186,23 @@ def pickup_step_seq(step: str) -> list:
             JOINT_HOME(),
         ]
     elif step == 'DESCEND':
-        # DRL 동작 3~4: ZIG 위치 이동 + Z -30mm 하강
-        return [
-            ZIG_HOME(),
-            ml_rel(Z_30_DOWN),
-        ]
+        if cube_x is not None and cube_y is not None:
+            # 워크스테이션 랜덤 위치 픽업
+            # Step 1: XY=랜덤, Z=INITIAL_STATE 높이(74.660mm)로 수평 이동
+            # Step 2: Z를 WORKSTATION_GRIP_Z(13.71mm)까지 수직 하강
+            approach_z  = INITIAL_STATE[2]                      # 74.660mm
+            descend_rel = -(approach_z - WORKSTATION_GRIP_Z)    # -60.95mm
+            orient      = INITIAL_STATE[3:]                     # rx,ry,rz 유지
+            return [
+                ml_abs([cube_x, cube_y, approach_z] + orient),
+                ml_rel([0, 0, descend_rel, 0, 0, 0]),
+            ]
+        else:
+            # ZIG Home 기준 임시 픽업 (cube_perception 연동 전 테스트용)
+            return [
+                ZIG_HOME(),
+                ml_rel(Z_30_DOWN),
+            ]
     elif step == 'GRIP':
         # DRL 동작 5: 큐브 파지
         return [
