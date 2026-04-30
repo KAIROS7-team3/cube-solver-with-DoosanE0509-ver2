@@ -1,4 +1,4 @@
-# RH‑P12‑RN(A) Controller (README3)
+# RH‑P12‑RN(A) Controller (README)
 
 이 문서는 `rh_p12_rna_controller`의 **최신 구조**(interfaces 패키지 분리 + owner 노드 + SafeGrasp + JSON/Binary TCP 옵션)를
 다른 사람이 바로 이해하고 실행할 수 있도록 정리한 “운용 가이드”입니다.
