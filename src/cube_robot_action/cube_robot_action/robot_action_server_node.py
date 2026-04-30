@@ -1,805 +1,381 @@
-import rclpy
-from rclpy.node import Node
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
+"""
+robot_action_server_node.py
+────────────────────────────
+명세서(cube_solver_node_spec) 3.1 기준 구현.
 
-from cube_interfaces.action import CubeMove
-from dsr_msgs2.srv import MoveLine, MoveJoint
+시나리오: 명령 → 동작 → 완료 리퀘스트 → 확인 → 다음 명령 패턴 반복
+오케스트레이터가 단계별로 액션을 호출하며 각 액션은
+완료 Result를 반환하여 다음 단계 진행 여부를 오케스트레이터가 결정한다.
+
+액션 서버 목록 (명세서 3.1):
+  - ExecuteSolveToken  : 솔빙 토큰 1개 실행
+  - PickupCube         : step 기반 4단계 픽업
+  - PlaceOnJig         : step 기반 2단계 안치
+  - GoHome             : INITIAL_STATE 복귀
+  - RotateCubeForFace  : 면별 단일 동작 스캔
+"""
 
 import time
 
-# ═══════════════════════════════════════════════
-# 공통 상수 (cube_motion_preamble.drl 기준)
-# ═══════════════════════════════════════════════
-VEL_X = 10.0   # 직선 이동 속도 (mm/sec) — movel 의 선속도
-VEL_R = 10.0   # 회전 이동 속도 (deg/sec) — movel 의 각속도
-ACC_X = 5.0   # 직선 이동 가속도 (mm/sec²)
-ACC_R = 5.0   # 회전 이동 가속도 (deg/sec²)
-VEL_J = 10.0   # joint 이동 속도 (deg/sec) — movej 전용
-ACC_J = 5.0   # joint 이동 가속도 (deg/sec²) — movej 전용
+import rclpy
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
 
-TIME_ML = 0.0  # movel 동작 완료까지 강제 시간 (sec)
-               # 0.0 이면 vel/acc 기준으로 자동 계산
-TIME_MJ = 0.0  # movej 동작 완료까지 강제 시간 (sec)
-               # 0.0 이면 vel/acc 기준으로 자동 계산
+from cube_robot_action.action import (
+    ExecuteSolveToken, PickupCube, PlaceOnJig, GoHome, RotateCubeForFace,
+)
+from dsr_msgs2.srv import (
+    MoveLine, MoveJoint, MoveStop,
+    ConfigCreateTcp, SetCurrentTcp, GetCurrentTcp,
+)
+from dsr_msgs2.srv import DrlStart
 
-# 그리퍼 TCP 오프셋 (link_6 → 그리퍼 끝단, mm 단위)
-# 실측 후 아래 값 교체 필요
-TCP_Z_OFFSET = 160.0  # ← 실측값으로 교체
+from .motion_library import (
+    Step, StepKind,
+    PULSE_OPEN, PULSE_CUBE,
+    TCP_NAME,
+    JOINT_HOME, ZIG_HOME,
+    token_sequence, VALID_TOKENS,
+    pickup_step_seq, PICKUP_STEPS,
+    rotate_face_seq, SCAN_FACES,
+    place_step_seq, PLACE_STEPS,
+    VEL_X, VEL_R, ACC_X, ACC_R, VEL_J, ACC_J,
+)
 
-GRIP_RELEASE_STROKE = 100
-GRIP_GRAB_STROKE    = 420
-
-DR_BASE        = 0
-DR_MV_MOD_ABS  = 0
-DR_MV_MOD_REL  = 1
-
-POS_INITIAL = [373.030, 0.000, 74.660 + TCP_Z_OFFSET, 22.85, -180.0, 22.85]
-
-# 워크스테이션 큐브 파지 Z 고정값 (큐브인식모션테스트.tw 실측값)
-# 워크스테이션 바닥이 평평하므로 XY 위치와 무관하게 항상 동일한 Z에서 파지
-WORKSTATION_GRIP_Z = 13.71 + TCP_Z_OFFSET  # mm (TCP 오프셋 반영)
-POS_L_DROP      = [373.030,  0.000, 48.530, 90.0,    90.0,  90.0 ]
-POS_R_DROP      = [373.030,  0.000, 48.530, 90.0,   -90.0,  90.0 ]
-POS_READY_D_LOW = [373.010,  0.000, 20.000, 22.85, -180.0,  22.85]
-POS_READY_D_UP  = [373.020,  0.000, 27.730,  6.68, -180.0,   6.68]
+Z_SAFE_LIMIT: float = 10.0
+DR_BASE       = 0
+DR_MV_MOD_ABS = 0
+DR_MV_MOD_REL = 1
 
 
 class RobotActionServerNode(Node):
+    """
+    팔+그리퍼 합성 동작 액션 서버 노드. (명세서 3.1)
+    각 액션은 오케스트레이터의 명령에 의해 단계별로 호출되며
+    완료 Result를 반환하여 다음 단계로의 진행을 오케스트레이터가 결정한다.
+    """
+
     def __init__(self):
         super().__init__('robot_action_server_node')
         self.cb_group = ReentrantCallbackGroup()
 
-        # ── Doosan 서비스 클라이언트 ──
-        self.movel_cli = self.create_client(
-            MoveLine, '/motion/move_line',
-            callback_group=self.cb_group
-        )
-        self.movej_cli = self.create_client(
-            MoveJoint, '/motion/move_joint',
-            callback_group=self.cb_group
-        )
+        self.declare_parameter('robot_ns', '')
+        ns = self.get_parameter('robot_ns').get_parameter_value().string_value
+        _p = f'/{ns}' if ns else ''
 
-        # 서비스 대기
+        self.movel_cli   = self.create_client(MoveLine,  f'{_p}/motion/move_line',        callback_group=self.cb_group)
+        self.movej_cli   = self.create_client(MoveJoint, f'{_p}/motion/move_joint',       callback_group=self.cb_group)
+        self.stop_cli    = self.create_client(MoveStop,  f'{_p}/motion/move_stop',        callback_group=self.cb_group)
+        self.cfg_tcp_cli = self.create_client(ConfigCreateTcp, f'{_p}/tcp/config_create_tcp', callback_group=self.cb_group)
+        self.set_tcp_cli = self.create_client(SetCurrentTcp,   f'{_p}/tcp/set_current_tcp',   callback_group=self.cb_group)
+        self.get_tcp_cli = self.create_client(GetCurrentTcp,   f'{_p}/tcp/get_current_tcp',   callback_group=self.cb_group)
+        self.drl_cli     = self.create_client(DrlStart,  '/drl/drl_start',                callback_group=self.cb_group)
+
         self._wait_for_services()
 
-        # ── CubeMove Action 서버 ──
-        self._action_server = ActionServer(
-            self,
-            CubeMove,
-            'cube_move',
-            execute_callback=self.execute_cb,
-            goal_callback=self.goal_cb,
-            cancel_callback=self.cancel_cb,
-            callback_group=self.cb_group
-        )
+        # 5개 액션 서버 등록 (명세서 3.1)
+        ActionServer(self, ExecuteSolveToken,  'cube_robot_action/execute_solve_token',
+                     execute_callback=self._exec_token_cb,  goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
+        ActionServer(self, PickupCube,         'cube_robot_action/pickup_cube',
+                     execute_callback=self._pickup_cb,      goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
+        ActionServer(self, PlaceOnJig,         'cube_robot_action/place_on_jig',
+                     execute_callback=self._place_cb,       goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
+        ActionServer(self, GoHome,             'cube_robot_action/go_home',
+                     execute_callback=self._home_cb,        goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
+        ActionServer(self, RotateCubeForFace,  'cube_robot_action/rotate_cube_for_face',
+                     execute_callback=self._rotate_face_cb, goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
 
-        # ── 동작 시퀀스 맵 ──
-        self.sequence_map = {
-            'F'  : self.seq_F,
-            "F'" : self.seq_F_prime,
-            'F2' : self.seq_F2,
-            'R'  : self.seq_R,
-            "R'" : self.seq_R_prime,
-            'R2' : self.seq_R2,
-            'U'  : self.seq_U,
-            "U'" : self.seq_U_prime,
-            'U2' : self.seq_U2,
-            'D'  : self.seq_D,
-            "D'" : self.seq_D_prime,
-            'D2' : self.seq_D2,
-            'L'  : self.seq_L,
-            "L'" : self.seq_L_prime,
-            'L2' : self.seq_L2,
-            'B'  : self.seq_B,
-            "B'" : self.seq_B_prime,
-            'B2' : self.seq_B2,
-            'P'  : self.seq_Perception,
-        }
+        self._tcp_ready = False
+        self._tcp_timer = self.create_timer(1.5, self._init_tcp_sync)
 
         self.get_logger().info('✅ RobotActionServerNode 초기화 완료')
+        self.get_logger().info(f'   유효 토큰: {VALID_TOKENS}')
 
-    # ─────────────────────────────────────────
-    # 서비스 대기
-    # ─────────────────────────────────────────
     def _wait_for_services(self):
         for cli, name in [
-            (self.movel_cli, '/motion/move_line'),
-            (self.movej_cli, '/motion/move_joint'),
+            (self.movel_cli,   'move_line'), (self.movej_cli, 'move_joint'),
+            (self.stop_cli,    'move_stop'), (self.drl_cli,   'drl_start'),
         ]:
-            timeout = 5.0
-            if not cli.wait_for_service(timeout_sec=timeout):
-                self.get_logger().error(f'❌ {name} 서비스 없음 — 로봇 연결 확인 필요')
+            if not cli.wait_for_service(timeout_sec=5.0):
+                self.get_logger().error(f'❌ {name} 없음')
             else:
                 self.get_logger().info(f'✅ {name} 연결됨')
 
-    # ─────────────────────────────────────────
-    # Action 콜백
-    # ─────────────────────────────────────────
-    def goal_cb(self, goal_request):
-        token = goal_request.move_token
-        if token not in self.sequence_map:
-            self.get_logger().warn(f'⚠️ 알 수 없는 동작: {token}')
+    def _init_tcp_sync(self):
+        self._tcp_timer.cancel()
+        try:
+            if self.drl_cli.service_is_ready():
+                req = DrlStart.Request()
+                req.robot_system = 0
+                req.code = f'set_tcp("{TCP_NAME}")'
+                self.drl_cli.call_async(req)
+                self.get_logger().info(f'✅ TCP 설정: {TCP_NAME}')
+        except Exception as e:
+            self.get_logger().warn(f'⚠️ TCP 예외: {e}')
+        self._tcp_ready = True
+        self.get_logger().info('🟢 초기화 완료 — 동작 명령 수신 가능')
+
+    async def _stop_robot(self):
+        if self.stop_cli.service_is_ready():
+            req = MoveStop.Request()
+            req.stop_mode = 1
+            await self.stop_cli.call_async(req)
+            self.get_logger().warn('🛑 즉시 정지')
+
+    def _goal_cb(self, goal_request):
+        if not self._tcp_ready:
             return GoalResponse.REJECT
-        self.get_logger().info(f'📥 Goal 수락: {token}')
         return GoalResponse.ACCEPT
 
-    def cancel_cb(self, goal_handle):
-        self.get_logger().info('🛑 취소 요청 수신')
+    def _cancel_cb(self, goal_handle):
+        self.get_logger().warn('🚨 취소 요청')
         return CancelResponse.ACCEPT
 
-    async def execute_cb(self, goal_handle):
-        token = goal_handle.request.move_token
-        self.get_logger().info(f'▶ 실행 시작: {token}')
+    def _feedback(self, gh, stage: str, progress: float = 0.0):
+        try:
+            fb = gh.action_type.Feedback()
+            if hasattr(fb, 'stage'):   fb.stage    = stage
+            if hasattr(fb, 'progress'): fb.progress = float(progress)
+            gh.publish_feedback(fb)
+        except Exception:
+            pass
 
-        feedback = CubeMove.Feedback()
-        result   = CubeMove.Result()
-
-        seq_func = self.sequence_map[token]
-        steps    = seq_func()  # 시퀀스 리스트 반환
-        total    = len(steps)
-
-        for i, (step_name, coro) in enumerate(steps):
-            # 취소 확인
-            if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-                result.success = False
-                result.message = '취소됨'
-                return result
-
-            # 피드백 발행
-            feedback.current_step = step_name
-            feedback.steps_done   = i
-            feedback.steps_total  = total
-            goal_handle.publish_feedback(feedback)
-            self.get_logger().info(f'  [{i+1}/{total}] {step_name}')
-
-            # 실제 실행
-            ok = await coro
+    # ─────────────────────────────────────────────────────
+    # _run_sequence: Step 리스트 순회 (명세서 3.1)
+    # ─────────────────────────────────────────────────────
+    async def _run_sequence(self, gh, steps: list):
+        for i, step in enumerate(steps):
+            if gh.is_cancel_requested:
+                await self._stop_robot()
+                gh.canceled()
+                return None
+            self.get_logger().info(f'  [{i+1}/{len(steps)}] {step.kind.name}')
+            ok = await self._exec_step(step)
+            if gh.is_cancel_requested:
+                await self._stop_robot()
+                gh.canceled()
+                return None
             if not ok:
-                goal_handle.abort()
-                result.success        = False
-                result.message        = f'{step_name} 실패'
-                result.steps_executed = i
-                return result
+                await self._stop_robot()
+                gh.abort()
+                return False
+        return True
 
-        goal_handle.succeed()
-        result.success        = True
-        result.message        = f'{token} 완료'
-        result.steps_executed = total
-        self.get_logger().info(f'✅ {token} 완료')
+    # ─────────────────────────────────────────────────────
+    # ExecuteSolveToken 골 콜백 (명세서 3.1 _exec_token_cb)
+    # ─────────────────────────────────────────────────────
+    async def _exec_token_cb(self, gh):
+        token = gh.request.token
+        self.get_logger().info(f'▶ ExecuteSolveToken: {token}')
+        result = ExecuteSolveToken.Result()
+        if token not in VALID_TOKENS:
+            result.success = False
+            result.message = f'알 수 없는 토큰: {token}'
+            gh.abort()
+            return result
+
+        self._feedback(gh, 'approach', 0.0)
+        steps = [JOINT_HOME()] + token_sequence(token) + [JOINT_HOME()]
+        ok = await self._run_sequence(gh, steps)
+
+        if ok is None:
+            result.success, result.message = False, f'{token} 취소됨'
+        elif not ok:
+            result.success, result.message = False, f'{token} 실패'
+        else:
+            gh.succeed()
+            result.success, result.message = True, f'{token} 완료'
+            self._feedback(gh, 'retreat', 1.0)
         return result
 
-    # ─────────────────────────────────────────
-    # 기본 이동 함수
-    # ─────────────────────────────────────────
+    # ─────────────────────────────────────────────────────
+    # PickupCube 골 콜백 (명세서 3.1 _pickup_cb)
+    # step: RELEASE_HOME | DESCEND | GRIP | LIFT
+    # DRL 동작 1~6 분배
+    # ─────────────────────────────────────────────────────
+    async def _pickup_cb(self, gh):
+        step = gh.request.step
+        self.get_logger().info(f'▶ PickupCube step: {step}')
+        result = PickupCube.Result()
 
-    async def movel_abs(self, pos):
-        # Z축 안전 체크
-        # 안전 Z축 하한선 (mm) — 이 값 이하로 내려가면 차단
-        Z_SAFE_LIMIT = 10.0        
-        if pos[2] < Z_SAFE_LIMIT:
-            self.get_logger().error(
-                f'🚨 안전 한계 초과! Z={pos[2]}mm '
-                f'(최소 {Z_SAFE_LIMIT}mm) — 동작 차단'
-            )
+        if step not in PICKUP_STEPS:
+            result.success = False
+            result.message = f'알 수 없는 step: {step}'
+            gh.abort()
+            return result
+
+        # cube_pose XY 좌표 추출 (m → mm 변환)
+        # cube_pose가 (0,0)이면 ZIG Home 기준 동작 (임시 픽업)
+        # cube_pose XY 값이 있으면 워크스테이션 랜덤 위치 픽업
+        cube_x, cube_y = None, None
+        try:
+            pose = gh.request.cube_pose.pose
+            if pose.position.x != 0.0 or pose.position.y != 0.0:
+                cube_x = pose.position.x * 1000.0  # m → mm
+                cube_y = pose.position.y * 1000.0  # m → mm
+                self.get_logger().info(
+                    f'  cube_pose 수신: x={cube_x:.1f}mm y={cube_y:.1f}mm'
+                    f' → 워크스테이션 랜덤 위치 픽업')
+            else:
+                self.get_logger().info(
+                    '  cube_pose 없음(0,0) → ZIG Home 기준 임시 픽업')
+        except Exception as e:
+            self.get_logger().warn(f'  cube_pose 파싱 실패({e}) → ZIG Home 기준')
+
+        self._feedback(gh, step.lower(), 0.0)
+        steps = pickup_step_seq(step, cube_x, cube_y)
+        ok = await self._run_sequence(gh, steps)
+
+        if ok is None:
+            result.success, result.message = False, f'PickupCube {step} 취소됨'
+        elif not ok:
+            result.success, result.message = False, f'PickupCube {step} 실패'
+        else:
+            gh.succeed()
+            result.success, result.message = True, f'PickupCube {step} 완료'
+            self._feedback(gh, step.lower(), 1.0)
+        return result
+
+    # ─────────────────────────────────────────────────────
+    # PlaceOnJig 골 콜백 (명세서 3.1 _place_cb)
+    # step: APPROACH | RELEASE
+    # DRL 동작 14~16 분배
+    # ─────────────────────────────────────────────────────
+    async def _place_cb(self, gh):
+        step = gh.request.step
+        self.get_logger().info(f'▶ PlaceOnJig step: {step}')
+        result = PlaceOnJig.Result()
+
+        if step not in PLACE_STEPS:
+            result.success = False
+            result.message = f'알 수 없는 step: {step}'
+            gh.abort()
+            return result
+
+        self._feedback(gh, step.lower(), 0.0)
+        steps = place_step_seq(step)
+        ok = await self._run_sequence(gh, steps)
+
+        if ok is None:
+            result.success, result.message = False, f'PlaceOnJig {step} 취소됨'
+        elif not ok:
+            result.success, result.message = False, f'PlaceOnJig {step} 실패'
+        else:
+            gh.succeed()
+            result.success, result.message = True, f'PlaceOnJig {step} 완료'
+            self._feedback(gh, step.lower(), 1.0)
+        return result
+
+    # ─────────────────────────────────────────────────────
+    # GoHome 골 콜백 (명세서 3.1 _home_cb)
+    # ─────────────────────────────────────────────────────
+    async def _home_cb(self, gh):
+        self.get_logger().info('▶ GoHome')
+        result = GoHome.Result()
+        self._feedback(gh, 'moving', 0.0)
+        ok = await self._run_sequence(gh, [JOINT_HOME(), ZIG_HOME(), JOINT_HOME()])
+        if ok is None:
+            result.success, result.message = False, 'GoHome 취소됨'
+        elif not ok:
+            result.success, result.message = False, 'GoHome 실패'
+        else:
+            gh.succeed()
+            result.success, result.message = True, 'GoHome 완료'
+            self._feedback(gh, 'done', 1.0)
+        return result
+
+    # ─────────────────────────────────────────────────────
+    # RotateCubeForFace 골 콜백 (명세서 3.1 _rotate_face_cb)
+    # next_face: B | R | F | L | D | B_AGAIN
+    # DRL 동작 7~13 분배
+    # ─────────────────────────────────────────────────────
+    async def _rotate_face_cb(self, gh):
+        next_face = gh.request.next_face
+        self.get_logger().info(f'▶ RotateCubeForFace: {next_face}')
+        result = RotateCubeForFace.Result()
+
+        if next_face not in SCAN_FACES:
+            result.success = False
+            gh.abort()
+            return result
+
+        self._feedback(gh, 'moving', 0.0)
+        steps = rotate_face_seq(next_face)
+        ok = await self._run_sequence(gh, steps)
+
+        if ok is None:
+            result.success = False
+        elif not ok:
+            result.success = False
+        else:
+            gh.succeed()
+            result.success = True
+            self._feedback(gh, 'done', 1.0)
+        return result
+
+    # ─────────────────────────────────────────────────────
+    # Step 실행
+    # ─────────────────────────────────────────────────────
+    async def _exec_step(self, step: Step) -> bool:
+        if step.kind == StepKind.MOVE_L_ABS:
+            return await self._movel(step, DR_MV_MOD_ABS)
+        elif step.kind == StepKind.MOVE_L_REL:
+            return await self._movel(step, DR_MV_MOD_REL)
+        elif step.kind in (StepKind.MOVE_J_ABS, StepKind.MOVE_J_REL):
+            return await self._movej(step)
+        elif step.kind == StepKind.GRIP:
+            return await self._grip(step)
+        elif step.kind == StepKind.WAIT:
+            time.sleep(step.sec or 0.5)
+            return True
+        return False
+
+    async def _movel(self, step: Step, mode: int) -> bool:
+        pos = step.pose
+        if mode == DR_MV_MOD_ABS and pos[2] < Z_SAFE_LIMIT:
+            self.get_logger().error(f'🚨 Z 안전 한계 초과: {pos[2]:.1f}mm')
             return False
         req = MoveLine.Request()
         req.pos        = [float(p) for p in pos]
-        req.vel        = [VEL_X, VEL_R]
-        req.acc        = [ACC_X, ACC_R]
-        req.time       = TIME_ML
+        req.vel        = [step.vel or VEL_X, step.acc or VEL_R]
+        req.acc        = [step.acc or ACC_X, step.acc or ACC_R]
+        req.time       = 0.0
         req.radius     = 0.0
         req.ref        = DR_BASE
-        req.mode       = DR_MV_MOD_ABS
+        req.mode       = mode
         req.blend_type = 0
         req.sync_type  = 0
         res = await self.movel_cli.call_async(req)
         time.sleep(0.3)
-        return res.success if res else False
+        return bool(res and res.success)
 
-    async def movel_rel(self, pos):
-        req = MoveLine.Request()
-        req.pos        = [float(p) for p in pos]
-        req.vel        = [VEL_X, VEL_R]
-        req.acc        = [ACC_X, ACC_R]
-        req.time       = TIME_ML
-        req.radius     = 0.0
-        req.ref        = DR_BASE
-        req.mode       = DR_MV_MOD_REL
-        req.blend_type = 0
-        req.sync_type  = 0
-        res = await self.movel_cli.call_async(req)
-        time.sleep(0.3)
-        return res.success if res else False
-
-    async def movej_rel(self, joints):
+    async def _movej(self, step: Step) -> bool:
         req = MoveJoint.Request()
-        req.pos        = [float(j) for j in joints]
-        req.vel        = VEL_J
-        req.acc        = ACC_J
-        req.time       = TIME_MJ
+        req.pos        = [float(j) for j in step.pose]
+        req.vel        = step.vel or VEL_J
+        req.acc        = step.acc or ACC_J
+        req.time       = 0.0
         req.radius     = 0.0
-        req.mode       = DR_MV_MOD_REL
+        req.mode       = DR_MV_MOD_ABS if step.kind == StepKind.MOVE_J_ABS else DR_MV_MOD_REL
         req.blend_type = 0
         req.sync_type  = 0
         res = await self.movej_cli.call_async(req)
         time.sleep(0.3)
-        return res.success if res else False
+        return bool(res and res.success)
 
-    async def gripper_release(self):
-        # 가상 모드: 실제 serial 없으므로 로그만
-        self.get_logger().info('  🤖 gripper_release (가상)')
+    async def _grip(self, step: Step) -> bool:
+        pulse = step.pulse
+        self.get_logger().info(f'  🤖 gripper {"OPEN" if pulse == PULSE_OPEN else "CLOSE"} (pulse={pulse})')
         time.sleep(0.5)
         return True
-
-    async def gripper_grap(self):
-        self.get_logger().info('  🤖 gripper_grap (가상)')
-        time.sleep(0.5)
-        return True
-
-    # ═══════════════════════════════════════════════
-    # 19개 시퀀스 정의
-    # 각 함수는 (step_name, coroutine) 리스트를 반환
-    # ═══════════════════════════════════════════════
-
-    def seq_U(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_U_prime(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_U2(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90 (1)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',      self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90 (1)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_D(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_READY_D_LOW',self.movel_abs(POS_READY_D_LOW)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_READY_D_UP', self.movel_abs(POS_READY_D_UP)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_D_prime(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_READY_D_LOW',self.movel_abs(POS_READY_D_LOW)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_READY_D_UP', self.movel_abs(POS_READY_D_UP)),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_D2(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_READY_D_LOW',self.movel_abs(POS_READY_D_LOW)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_READY_D_UP', self.movel_abs(POS_READY_D_UP)),
-            ('movej_rel J6+90 (1)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90 (1)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_R(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_R_prime(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_R2(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90 (1)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',      self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90 (1)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_L(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_L_prime(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_L2(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90 (1)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',      self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90 (1)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_F(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel X-17 Z-15',      self.movel_rel([-17,0,-15,0,0,0])),
-            ('movel_rel Z-10',           self.movel_rel([0,0,-10,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_F_prime(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel X-17 Z-15',      self.movel_rel([-17,0,-15,0,0,0])),
-            ('movel_rel Z-10',           self.movel_rel([0,0,-10,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_F2(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90 (1)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',      self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90 (1)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_R_DROP',     self.movel_abs(POS_R_DROP)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel X-17 Z-15',      self.movel_rel([-17,0,-15,0,0,0])),
-            ('movel_rel Z-10',           self.movel_rel([0,0,-10,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_B(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel X+17 Z-15',      self.movel_rel([17,0,-15,0,0,0])),
-            ('movel_rel Z-10',           self.movel_rel([0,0,-10,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_B_prime(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6-90',          self.movej_rel([0,0,0,0,0,-90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel X+17 Z-15',      self.movel_rel([17,0,-15,0,0,0])),
-            ('movel_rel Z-10',           self.movel_rel([0,0,-10,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_B2(self):
-        return [
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-40',           self.movel_rel([0,0,-40,0,0,0])),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movej_rel J6+90 (1)',      self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',      self.movej_rel([0,0,0,0,0,90])),
-            ('gripper_release 1',        self.gripper_release()),
-            ('gripper_release 2',        self.gripper_release()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movej_rel J6-90 (1)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',      self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_abs POS_L_DROP',     self.movel_abs(POS_L_DROP)),
-            ('gripper_grap 1',           self.gripper_grap()),
-            ('gripper_grap 2',           self.gripper_grap()),
-            ('movel_rel Z+40',           self.movel_rel([0,0,40,0,0,0])),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-            ('movej_rel J6+90',          self.movej_rel([0,0,0,0,0,90])),
-            ('movel_rel X+17 Z-15',      self.movel_rel([17,0,-15,0,0,0])),
-            ('movel_rel Z-10',           self.movel_rel([0,0,-10,0,0,0])),
-            ('gripper_release',          self.gripper_release()),
-            ('movel_abs POS_INITIAL',    self.movel_abs(POS_INITIAL)),
-        ]
-
-    def seq_PickupFromWorkstation(self, cube_x: float, cube_y: float):
-        """
-        워크스테이션 랜덤 위치 큐브 픽업 시퀀스.
-
-        cube_x, cube_y: cube_perception DetectCubePose가 반환한 XY 좌표 (mm)
-
-        동작 순서:
-          1) 그리퍼 개방
-          2) [cube_x, cube_y, POS_INITIAL Z] 수평 이동
-          3) Z 하강 → WORKSTATION_GRIP_Z(13.71mm + TCP_OFFSET)까지
-             하강량 = -(POS_INITIAL[2] - WORKSTATION_GRIP_Z)
-          4) 큐브 파지
-          5) Z +40mm 상승
-
-        TODO: 현재 approach Z = POS_INITIAL[2] 고정값
-              차후 개선 방향:
-                - approach Z = cube_pose.z + SAFE_OFFSET(30mm 이상)으로 동적 계산
-                - 객체 높이에 관계없이 범용 파지 가능하도록 보완
-        """
-        approach_z  = POS_INITIAL[2]
-        descend_rel = -(approach_z - WORKSTATION_GRIP_Z)  # -60.95mm
-        orient      = POS_INITIAL[3:]
-
-        return [
-            ('gripper_release',
-                self.gripper_release()),
-            ('movel_abs approach_xy',
-                self.movel_abs([cube_x, cube_y, approach_z] + orient)),
-            ('movel_rel descend_z',
-                self.movel_rel([0, 0, descend_rel, 0, 0, 0])),
-            ('gripper_grap',
-                self.gripper_grap()),
-            ('movel_rel lift_z',
-                self.movel_rel([0, 0, 40, 0, 0, 0])),
-        ]
-
-    def seq_Perception(self):
-        POS_CAMERA_R_DROP = [373.03, 12.36, 48.53, 90.0, -90.0, 90.0]
-        POS_CAMERA_L_DROP = [373.03, -12.96, 48.53, 90.0, 90.0, 90.0]
-        return [
-            ('gripper_release',              self.gripper_release()),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-30',               self.movel_rel([0,0,-30,0,0,0])),
-            ('gripper_grap',                 self.gripper_grap()),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-            ('movel_rel Y-293',              self.movel_rel([0,-293.33,0,0,0,0])),
-            ('movel_rel Z-57',               self.movel_rel([0,0,-57.78,0,0,0])),
-            ('movej_rel J6+90 (1)',          self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',          self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (3)',          self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6-90 (1)',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (3)',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z+57',               self.movel_rel([0,0,57.78,0,0,0])),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_CAMERA_R_DROP',  self.movel_abs(POS_CAMERA_R_DROP)),
-            ('gripper_release',              self.gripper_release()),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-            ('movel_rel Z-30',               self.movel_rel([0,0,-30,0,0,0])),
-            ('gripper_grap',                 self.gripper_grap()),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-            ('movel_rel Y-293',              self.movel_rel([0,-293.33,0,0,0,0])),
-            ('movel_rel Z-57',               self.movel_rel([0,0,-57.78,0,0,0])),
-            ('movej_rel J6+90 (1)',          self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6+90 (2)',          self.movej_rel([0,0,0,0,0,90])),
-            ('movej_rel J6-90 (1)',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movej_rel J6-90 (2)',          self.movej_rel([0,0,0,0,0,-90])),
-            ('movel_rel Z+57',               self.movel_rel([0,0,57.78,0,0,0])),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-            ('movel_abs POS_CAMERA_L_DROP',  self.movel_abs(POS_CAMERA_L_DROP)),
-            ('gripper_release',              self.gripper_release()),
-            ('movel_abs POS_INITIAL',        self.movel_abs(POS_INITIAL)),
-        ]
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = RobotActionServerNode()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
         executor.spin()
