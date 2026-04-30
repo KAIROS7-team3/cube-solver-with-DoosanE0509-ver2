@@ -1,3 +1,14 @@
+"""Gemini VLA 백엔드 (1차 시각 추출 전담).
+
+역할:
+- RGB 1장을 Gemini에 전달해 큐브 상단 중심 픽셀(`pixel_uv`)을 얻는다.
+- 윗면 정보 `top_color`, `top_face_9`를 함께 추출/검증한다.
+
+비역할:
+- depth 샘플링, camera/base 3D 좌표 계산은 하지 않는다.
+  (해당 책임은 `opencv_depth_backend.py`가 담당)
+"""
+
 import json
 import os
 from pathlib import Path
@@ -8,8 +19,10 @@ import numpy as np
 from .base import CubeDetector
 
 _DEFAULT_DETECT_FALLBACK = (
-    'Return JSON only: {"point": [y_norm, x_norm], "top_color": "W"}; '
-    "point normalized 0-1000 and top_color in W,R,G,Y,O,B."
+    'Return JSON only: {"point": [y_norm, x_norm], "top_color": "W", "top_face_9": "WWWWWWWWW"}; '
+    "point 0-1000; top_color in W,R,G,Y,O,B; top_face_9 exactly 9 letters W,R,G,Y,O,B only; "
+    "top_face_9 row-major on visible U face: rows left-to-right, top-to-bottom "
+    "(cells 123 / 456 / 789 → indices 0..8); top_face_9[4] must equal top_color (center)."
 )
 _DEFAULT_STATE_FALLBACK = (
     'Return JSON with "faces" (U,R,F,D,L,B nine chars each) and "state_54". '
@@ -18,14 +31,19 @@ _DEFAULT_STATE_FALLBACK = (
 
 
 class GeminiVLADetector(CubeDetector):
-    """Gemini 기반 큐브 감지·상태 추정."""
+    """Gemini 기반 2D/U면 시각 정보 추출기.
+
+    - `detect()`: 단일 RGB 입력에서 `pixel_uv`, `top_color`, `top_face_9`를 반환한다.
+    - `detect_state()`: 5면 이미지(B,R,F,L,D)로 전체 면 상태를 추정한다.
+    - depth 기반 3D 좌표 계산은 수행하지 않는다.
+    """
 
     _DETECT_PROMPT = Path(__file__).resolve().parent.parent / "prompts" / "gemini_detect_prompt.txt"
     _STATE_PROMPT = Path(__file__).resolve().parent.parent / "prompts" / "gemini_state_prompt.txt"
 
     def __init__(self, min_confidence: float = 0.5, depth_unit_scale: float = 0.001) -> None:
         self._min_confidence = float(min_confidence)
-        self._depth_unit_scale = float(depth_unit_scale)
+        _ = depth_unit_scale
 
     def detect(self, rgb: np.ndarray, depth: np.ndarray, K: np.ndarray) -> Tuple[Any, float]:
         self._validate_inputs(rgb, depth, K)
@@ -44,12 +62,10 @@ class GeminiVLADetector(CubeDetector):
         h, w = rgb.shape[:2]
         u = (float(det["x_norm"]) / 1000.0) * float(w)
         v = (float(det["y_norm"]) / 1000.0) * float(h)
-        cam_xyz = self._pixel_to_camera_xyz(u, v, depth, K)
-
         stub = {
-            "camera_xyz": cam_xyz,
             "pixel_uv": (u, v),
             "top_color": det["top_color"],
+            "top_face_9": det["top_face_9"],
             "source": "gemini_vla",
         }
         return stub, confidence
@@ -91,7 +107,7 @@ class GeminiVLADetector(CubeDetector):
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set.")
 
-        model_name = os.getenv("GEMINI_MODEL", "gemini-robotics-er-1.6-preview").strip()
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview").strip()
 
         try:
             from google import genai  # type: ignore[import-not-found]
@@ -111,7 +127,6 @@ class GeminiVLADetector(CubeDetector):
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.0,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         text = (response.text or "").strip()
@@ -150,7 +165,7 @@ class GeminiVLADetector(CubeDetector):
         except Exception as exc:
             raise RuntimeError("Need opencv-python or pillow for JPEG encoding") from exc
 
-    def _parse_detect_response(self, raw_output: str) -> Dict[str, float]:
+    def _parse_detect_response(self, raw_output: str) -> Dict[str, Any]:
         try:
             data = json.loads(raw_output)
         except json.JSONDecodeError as exc:
@@ -164,12 +179,24 @@ class GeminiVLADetector(CubeDetector):
         top_color = str(data.get("top_color", "")).strip().upper()
         if top_color not in {"W", "R", "G", "Y", "O", "B"}:
             raise ValueError(f"Bad 'top_color': {data.get('top_color')}")
+        top_face_9 = "".join(
+            ch for ch in str(data.get("top_face_9", "")).upper() if not ch.isspace()
+        )
+        if len(top_face_9) != 9:
+            raise ValueError(f"Bad 'top_face_9' length: {top_face_9}")
+        if any(ch not in {"W", "R", "G", "Y", "O", "B"} for ch in top_face_9):
+            raise ValueError(f"Bad 'top_face_9' chars: {top_face_9}")
+        if top_face_9[4] != top_color:
+            raise ValueError(
+                f"top_color and top_face_9 center mismatch: {top_color} vs {top_face_9[4]}"
+            )
 
         return {
             "x_norm": float(point[1]),
             "y_norm": float(point[0]),
             "confidence": float(data.get("confidence", 1.0)),
             "top_color": top_color,
+            "top_face_9": top_face_9,
         }
 
     def _parse_state_response(self, raw_output: str) -> Dict[str, Any]:
@@ -189,16 +216,28 @@ class GeminiVLADetector(CubeDetector):
         allowed = set("WRGYOB")
         out_faces: Dict[str, str] = {}
         for f in required:
-            s = str(faces.get(f, ""))
+            raw_val = faces.get(f, "")
+            s_raw = str(raw_val)
+            s = "".join(ch for ch in s_raw if not ch.isspace())
             if len(s) != 9:
-                raise ValueError(f"faces.{f} must be 9 chars")
+                raise ValueError(
+                    f"faces.{f} must be 9 sticker letters (after removing whitespace); "
+                    f"raw_len={len(s_raw)} norm_len={len(s)}: {repr(s_raw)[:220]}"
+                )
             if any(ch not in allowed for ch in s):
-                raise ValueError(f"faces.{f} invalid chars: {s}")
+                bad_positions = [(i, repr(ch)) for i, ch in enumerate(s) if ch not in allowed]
+                raise ValueError(
+                    f"faces.{f} invalid chars: repr={repr(s)[:220]} bad={bad_positions[:12]}"
+                )
             out_faces[f] = s
 
-        state_54 = str(data["state_54"])
+        state_raw = str(data["state_54"])
+        state_54 = "".join(ch for ch in state_raw if not ch.isspace())
         if len(state_54) != 54:
-            raise ValueError("state_54 must be 54 chars")
+            raise ValueError(
+                f"state_54 must be 54 chars (after removing whitespace); "
+                f"raw_len={len(state_raw)} norm_len={len(state_54)}: {repr(state_raw)[:140]}"
+            )
         if any(ch not in allowed for ch in state_54):
             raise ValueError("state_54 invalid chars")
 
@@ -210,31 +249,3 @@ class GeminiVLADetector(CubeDetector):
         if not (0.0 <= det["x_norm"] <= 1000.0) or not (0.0 <= det["y_norm"] <= 1000.0):
             raise ValueError(f"norm out of range: {det['x_norm']}, {det['y_norm']}")
 
-    def _pixel_to_camera_xyz(
-        self,
-        u: float,
-        v: float,
-        depth: np.ndarray,
-        K: np.ndarray,
-    ) -> Tuple[float, float, float]:
-        h, w = depth.shape
-        ui = int(round(u))
-        vi = int(round(v))
-        if ui < 0 or ui >= w or vi < 0 or vi >= h:
-            raise ValueError(f"pixel ({u}, {v}) out of bounds for ({w}x{h})")
-
-        z_raw = float(depth[vi, ui])
-        z = z_raw * self._depth_unit_scale
-        if not np.isfinite(z) or z <= 0.0:
-            raise ValueError(f"invalid depth at ({ui},{vi}): raw={z_raw}, scaled={z}")
-
-        fx = float(K[0, 0])
-        fy = float(K[1, 1])
-        cx = float(K[0, 2])
-        cy = float(K[1, 2])
-        if fx == 0.0 or fy == 0.0:
-            raise ValueError("invalid intrinsics fx/fy")
-
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        return (x, y, z)
