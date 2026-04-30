@@ -1,15 +1,15 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>cube_robot_action</name>
-  <version>0.2.0</version>
-  <description>Cube robot action server — TCP 서비스 기반 리팩토링</description>
-  <maintainer email="iys@example.com">iys</maintainer>
+  <version>0.3.0</version>
+  <description>팔+그리퍼 합성 동작 액션 서버 — 명세서 3.1 기준</description>
+  <maintainer email="yeonseop8714@gmail.com">IYS02</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
   <depend>dsr_msgs2</depend>
-  <depend>cube_interfaces</depend>
   <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
   <depend>action_msgs</depend>
   <export>
     <build_type>ament_python</build_type>

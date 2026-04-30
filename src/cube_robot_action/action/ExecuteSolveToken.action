@@ -1,0 +1,10 @@
+# Goal
+string token          # 솔빙 토큰 (예: "U", "R'", "F2")
+---
+# Result
+bool   success
+string message
+---
+# Feedback
+string  stage         # "approach"|"grab"|"rotate"|"release"|"retreat"
+float32 progress      # 0.0 ~ 1.0

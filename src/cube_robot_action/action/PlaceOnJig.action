@@ -1,0 +1,12 @@
+# Goal
+# step: 안치 단계 식별자 (명령-동작-완료 패턴 분리)
+#   "APPROACH" — movel ZIG + movel Z-30mm
+#   "RELEASE"  — gripper_release
+string step
+---
+# Result
+bool   success
+string message
+---
+# Feedback
+string stage     # "moving"|"descend"|"release"|"done"
