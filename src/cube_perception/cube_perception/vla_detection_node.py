@@ -32,7 +32,7 @@ from .detection.gemini_vla_backend import GeminiVLADetector
 from .detection.opencv_depth_backend import OpenCVDepthDetector
 
 try:
-    from cube_perception.srv import DetectCubePose
+    from cube_interfaces.srv import DetectCubePose
 except ImportError:
     DetectCubePose = None
 

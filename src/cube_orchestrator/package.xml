@@ -2,10 +2,19 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>cube_orchestrator</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="seojunsoo312@gmail.com">junsoo</maintainer>
+  <version>0.1.0</version>
+  <description>FSM orchestrator for the cube solver: drives perception, pickup, place, perceive, solve and execute-token actions.</description>
+  <maintainer email="hhyukjin@todo.todo">hhyukjin</maintainer>
   <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>cube_interfaces</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!-- kociemba: pip install kociemba -->
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

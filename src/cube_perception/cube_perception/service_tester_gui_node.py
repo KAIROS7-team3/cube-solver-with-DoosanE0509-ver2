@@ -12,7 +12,7 @@ from std_msgs.msg import String
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from cube_perception.srv import DetectCubePose, ExtractFace, GetCubeState
+from cube_interfaces.srv import DetectCubePose, ExtractFace, GetCubeState
 
 
 class ServiceTesterNode(Node):

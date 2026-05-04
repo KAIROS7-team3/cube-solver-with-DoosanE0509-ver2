@@ -7,9 +7,9 @@ import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from rh_p12_rna_controller.gripper_node import GripperNode, ModbusRTU
-from rh_p12_rna_controller_interfaces.action import SafeGrasp
-from rh_p12_rna_controller_interfaces.srv import GetState, SetPosition
-from rh_p12_rna_controller_interfaces.msg import GripperState
+from cube_interfaces.action import SafeGrasp
+from cube_interfaces.srv import GetState, SetPosition
+from cube_interfaces.msg import GripperState
 
 
 class GripperServiceNode(GripperNode):

@@ -23,7 +23,7 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.qos import qos_profile_sensor_data
 
-from rh_p12_rna_controller.action import GripperCommand
+from cube_interfaces.action import GripperCommand
 from dsr_msgs2.srv import DrlStart
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String

@@ -18,12 +18,12 @@ robot_action_server_node.py
 import time
 
 import rclpy
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from cube_robot_action.action import (
+from cube_interfaces.action import (
     ExecuteSolveToken, PickupCube, PlaceOnJig, GoHome, RotateCubeForFace,
 )
 from dsr_msgs2.srv import (
@@ -31,6 +31,7 @@ from dsr_msgs2.srv import (
     ConfigCreateTcp, SetCurrentTcp, GetCurrentTcp,
 )
 from dsr_msgs2.srv import DrlStart
+from cube_interfaces.action import SafeGrasp
 
 from .motion_library import (
     Step, StepKind,
@@ -48,6 +49,11 @@ Z_SAFE_LIMIT: float = 10.0
 DR_BASE       = 0
 DR_MV_MOD_ABS = 0
 DR_MV_MOD_REL = 1
+
+GRIP_GOAL_CURRENT: int     = 500
+GRIP_THRESHOLD_CLOSE: int  = 300
+GRIP_THRESHOLD_OPEN: int   = 9999
+GRIP_TIMEOUT_SEC: float    = 5.0
 
 
 class RobotActionServerNode(Node):
@@ -72,6 +78,8 @@ class RobotActionServerNode(Node):
         self.set_tcp_cli = self.create_client(SetCurrentTcp,   f'{_p}/tcp/set_current_tcp',   callback_group=self.cb_group)
         self.get_tcp_cli = self.create_client(GetCurrentTcp,   f'{_p}/tcp/get_current_tcp',   callback_group=self.cb_group)
         self.drl_cli     = self.create_client(DrlStart,  '/drl/drl_start',                callback_group=self.cb_group)
+
+        self.grip_cli = ActionClient(self, SafeGrasp, '/gripper/safe_grasp', callback_group=self.cb_group)
 
         self._wait_for_services()
 
@@ -102,6 +110,10 @@ class RobotActionServerNode(Node):
                 self.get_logger().error(f'❌ {name} 없음')
             else:
                 self.get_logger().info(f'✅ {name} 연결됨')
+        if not self.grip_cli.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('❌ /gripper/safe_grasp 액션 서버 없음')
+        else:
+            self.get_logger().info('✅ /gripper/safe_grasp 연결됨')
 
     def _init_tcp_sync(self):
         self._tcp_timer.cancel()
@@ -339,7 +351,7 @@ class RobotActionServerNode(Node):
             return False
         req = MoveLine.Request()
         req.pos        = [float(p) for p in pos]
-        req.vel        = [step.vel or VEL_X, step.acc or VEL_R]
+        req.vel        = [step.vel or VEL_X, step.vel or VEL_R]
         req.acc        = [step.acc or ACC_X, step.acc or ACC_R]
         req.time       = 0.0
         req.radius     = 0.0
@@ -367,8 +379,25 @@ class RobotActionServerNode(Node):
 
     async def _grip(self, step: Step) -> bool:
         pulse = step.pulse
-        self.get_logger().info(f'  🤖 gripper {"OPEN" if pulse == PULSE_OPEN else "CLOSE"} (pulse={pulse})')
-        time.sleep(0.5)
+        is_open = (pulse == PULSE_OPEN)
+        goal = SafeGrasp.Goal()
+        goal.target_position  = int(pulse)
+        goal.goal_current     = GRIP_GOAL_CURRENT
+        goal.current_threshold = GRIP_THRESHOLD_OPEN if is_open else GRIP_THRESHOLD_CLOSE
+        goal.timeout_sec      = GRIP_TIMEOUT_SEC
+        self.get_logger().info(f'  🤖 gripper {"OPEN" if is_open else "CLOSE"} (pulse={pulse})')
+        gh = await self.grip_cli.send_goal_async(goal)
+        if not gh.accepted:
+            self.get_logger().error('  ❌ gripper goal rejected')
+            return False
+        result_wrap = await gh.get_result_async()
+        res = result_wrap.result
+        if not res.success:
+            self.get_logger().error(f'  ❌ gripper failed: {res.message}')
+            return False
+        self.get_logger().info(
+            f'  ✅ gripper done: pos={res.final_position} cur={res.final_current} grasped={res.grasped}'
+        )
         return True
 
 

@@ -1,0 +1,16 @@
+# Goal
+# step: 픽업 단계 식별자 (명령-동작-완료 패턴 분리)
+#   "RELEASE_HOME" — gripper_release + movej Home
+#   "DESCEND"      — movel ZIG + movel Z-30mm
+#   "GRIP"         — gripper_grap
+#   "LIFT"         — movel Z+40mm
+# cube_pose: RELEASE_HOME 단계에서만 사용 (임시 ZIG 픽업 시 무시 가능)
+string step
+geometry_msgs/PoseStamped cube_pose
+---
+# Result
+bool   success
+string message
+---
+# Feedback
+string stage     # "release"|"moving"|"descend"|"grip"|"lift"

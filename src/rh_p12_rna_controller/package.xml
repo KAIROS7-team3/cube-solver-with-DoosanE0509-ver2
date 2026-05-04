@@ -3,27 +3,18 @@
 <package format="3">
   <name>rh_p12_rna_controller</name>
   <version>0.1.0</version>
-  <description>ROS 2 Action 기반 RH-P12-RN(A) 그리퍼 제어 노드 (Action 정의 포함)</description>
+  <description>ROS 2 Action 기반 RH-P12-RN(A) 그리퍼 제어 노드</description>
   <maintainer email="cube@todo.com">cube_team</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
-  <buildtool_depend>rosidl_default_generators</buildtool_depend>
-
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>builtin_interfaces</depend>
-  <depend>dsr_msgs2</depend>
-  <depend>sensor_msgs</depend>
-  <depend>std_srvs</depend>
-  <depend>rh_p12_rna_controller_interfaces</depend>
-
-  <exec_depend>rosidl_default_runtime</exec_depend>
-
-  <member_of_group>rosidl_interface_packages</member_of_group>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>dsr_msgs2</exec_depend>
+  <exec_depend>cube_interfaces</exec_depend>
 
   <export>
-    <build_type>ament_cmake</build_type>
+    <build_type>ament_python</build_type>
   </export>
 </package>
