@@ -34,13 +34,52 @@ git clone -b humble https://github.com/doosan-robotics/doosan-robot2.git src/doo
 - Ubuntu 22.04
 - ROS2 Humble
 - Python 3.10
-- 의존 패키지: `doosan-robot2`, `realsense-ros`, `kociemba` (`pip install kociemba`)
+
+### ROS2 / apt 의존 패키지
+
+- `doosan-robot2` (별도 git clone)
+- `realsense-ros` (apt: `ros-humble-realsense2-camera`)
+- `cv_bridge` (apt: `ros-humble-cv-bridge`)
+- `python3-pyqt5` (apt: `python3-pyqt5`) — `service_tester_gui_node`용
+
+### pip 전용 의존 패키지 (rosdep으로 안 깔림 — 수동 설치 필요)
+
+| 패키지 (pip) | 사용처 | 비고 |
+|---|---|---|
+| `kociemba` | `cube_orchestrator` | 큐브 솔빙 알고리즘 |
+| `google-genai` | `cube_perception` | Gemini VLA 검출 + 색상 분류 백엔드 |
+| `python-dotenv` | `cube_perception` | 워크스페이스 루트 `.env` 로드 |
+| `fastapi` | `cube_webui` | Web UI HTTP/WebSocket 서버 |
+| `uvicorn[standard]` | `cube_webui` | ASGI 서버 |
+| `opencv-python` | `cube_webui`, `cube_perception` | MJPEG 인코딩, 이미지 처리 (apt `python3-opencv`로 대체 가능) |
+| `numpy` | `cube_perception` | 보통 ROS2 환경에 기본 포함 |
+
+**한 줄로 설치:**
+
+```bash
+pip install kociemba google-genai python-dotenv fastapi "uvicorn[standard]" opencv-python numpy
+```
+
+> ℹ️ pip 패키지는 `setup.py`의 `install_requires`에도 등록되어 있지만, `colcon build`는 자동으로 pip install을 실행하지 않으므로 위 명령으로 한 번 깔아둬야 합니다.
+
+### 환경 변수 (`cube_perception`)
+
+워크스페이스 루트(`cube-solver-with-DoosanE0509-ver2/`)에 `.env` 파일을 두고 다음을 설정:
+
+```
+GEMINI_API_KEY=<your_key>
+GEMINI_MODEL=gemini-2.5-pro   # 또는 사용 모델명
+```
+
+`python-dotenv`가 cwd 기준으로 `.env`를 찾으므로 **반드시 워크스페이스 루트에서 `ros2 launch ...`를 실행**해야 합니다. `.env`는 `.gitignore`에 등록되어 커밋되지 않습니다.
 
 ---
 
 ## 시스템 구조
 
-6개 기능 패키지 + 1개 인터페이스 패키지 + 1개 외부 드라이버로 구성됩니다.
+5개 기능 패키지 + 1개 통합 인터페이스 패키지(`cube_interfaces`) + 1개 외부 드라이버로 구성됩니다.
+
+> ℹ️ **인터페이스 통합**: 모든 액션/서비스/메시지는 단일 `cube_interfaces` (ament_cmake) 패키지에 모여 있습니다. 노드 패키지(`cube_robot_action`, `cube_orchestrator`, `cube_perception`, `cube_webui`, `rh_p12_rna_controller`)는 모두 ament_python이며, import는 일관되게 `cube_interfaces.{action,srv,msg}` 형태입니다.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -83,8 +122,8 @@ git clone -b humble https://github.com/doosan-robotics/doosan-robot2.git src/doo
 | `cube_perception` | 카메라 I/O, 큐브 3D pose 감지, 면 색상 추출 | srv: `DetectCubePose`, `ExtractFace`, `GetCubeState` | ✅ 구현 완료 |
 | `cube_robot_action` | 팔+그리퍼 합성 동작 액션 서버 (단일 노드, 다중 액션) | action: `ExecuteSolveToken`, `PickupCube`, `PlaceOnJig`, `GoHome`, `RotateCubeForFace` | ✅ 구현 완료 |
 | `cube_orchestrator` | FSM + kociemba + 토큰 디스패치 | srv: `StartRun`, `StartScan`, `StartSolve` | ✅ 구현 완료 |
-| `rh_p12_rna_controller` | Modbus 기반 그리퍼 액션 서버 | action: `SafeGrasp` | ✅ 구현 완료 |
-| `rh_p12_rna_controller_interfaces` | 그리퍼 인터페이스 정의 | action: `SafeGrasp`, `GripperCommand` | ✅ |
+| `rh_p12_rna_controller` | Modbus 기반 그리퍼 액션/서비스 서버 (`gripper_node`, `gripper_service_node`) | action: `SafeGrasp`, `GripperCommand` / srv: `GetState`, `SetPosition` / msg: `GripperState` | ✅ 구현 완료 |
+| `cube_interfaces` | **통합 인터페이스 패키지** (모든 action/srv/msg 정의, ament_cmake) | action 5종 + srv 6종 + msg 1종 — 자세한 내용은 아래 표 | ✅ |
 | `cube_webui` | FastAPI 기반 웹 UI (카메라 스트림, scan/solve 버튼) | HTTP/WebSocket/MJPEG (포트 8080) | ✅ 구현 완료 |
 | `doosan-robot2` | 로봇 암 드라이버 (수정 없이 재사용) | srv: `MoveLine`, `MoveJoint` | 외부 패키지 |
 
@@ -94,42 +133,54 @@ git clone -b humble https://github.com/doosan-robotics/doosan-robot2.git src/doo
 
 ```
 src/
-├── cube_orchestrator/
+├── cube_interfaces/                      # 통합 인터페이스 (ament_cmake)
 │   ├── CMakeLists.txt
 │   ├── package.xml
-│   ├── cube_orchestrator/
-│   │   └── master_orchestrator_node.py   # FSM + kociemba
-│   ├── srv/
+│   ├── cube_robot_action/action/
+│   │   ├── ExecuteSolveToken.action
+│   │   ├── GoHome.action
+│   │   ├── PickupCube.action
+│   │   ├── PlaceOnJig.action
+│   │   └── RotateCubeForFace.action
+│   ├── cube_orchestrator/srv/
 │   │   ├── StartRun.srv
 │   │   ├── StartScan.srv
 │   │   └── StartSolve.srv
+│   ├── cube_perception/srv/
+│   │   ├── DetectCubePose.srv
+│   │   ├── ExtractFace.srv
+│   │   └── GetCubeState.srv
+│   └── rh_p12_rna_controller/
+│       ├── action/{SafeGrasp,GripperCommand}.action
+│       ├── srv/{GetState,SetPosition}.srv
+│       └── msg/GripperState.msg
+│
+├── cube_orchestrator/                    # ament_python
+│   ├── package.xml
+│   ├── cube_orchestrator/
+│   │   └── master_orchestrator_node.py   # FSM + kociemba (517 lines)
 │   ├── launch/
 │   │   ├── full_stack.launch.py
 │   │   └── orchestrator.launch.py
 │   └── scripts/
 │       └── master_orchestrator_node
 │
-├── cube_perception/
+├── cube_perception/                      # ament_python
 │   └── cube_perception/
 │       ├── vla_detection_node.py
 │       ├── color_extraction_node.py
+│       ├── service_tester_gui_node.py
 │       └── detection/
 │           ├── base.py                   # CubeDetector(ABC)
 │           ├── opencv_depth_backend.py
-│           └── gemini_vla_backend.py
+│           └── gemini_vla_backend.py     # python-dotenv + Gemini
 │
-├── cube_robot_action/
-│   ├── cube_robot_action/
-│   │   ├── robot_action_server_node.py
-│   │   └── motion_library.py             # 18 토큰 Step 시퀀스
-│   └── action/
-│       ├── ExecuteSolveToken.action
-│       ├── PickupCube.action
-│       ├── PlaceOnJig.action
-│       ├── GoHome.action
-│       └── RotateCubeForFace.action
+├── cube_robot_action/                    # ament_python
+│   └── cube_robot_action/
+│       ├── robot_action_server_node.py   # SafeGrasp 액션 클라이언트 연결됨
+│       └── motion_library.py             # 18 토큰 Step 시퀀스
 │
-├── cube_webui/
+├── cube_webui/                           # ament_python
 │   ├── cube_webui/
 │   │   ├── server.py                     # FastAPI + rclpy
 │   │   └── static/
@@ -138,17 +189,15 @@ src/
 │   └── launch/
 │       └── webui.launch.py
 │
-├── rh_p12_rna_controller/
+├── rh_p12_rna_controller/                # ament_python
 │   └── rh_p12_rna_controller/
-│       └── gripper_node.py               # Modbus FC03/FC06
-│
-├── rh_p12_rna_controller_interfaces/
-│   └── action/
-│       ├── SafeGrasp.action
-│       └── GripperCommand.action
+│       ├── gripper_node.py               # Modbus FC03/FC06 (DRL inject)
+│       └── gripper_service_node.py       # /gripper/safe_grasp owner
 │
 └── doosan-robot2/                        # 외부 드라이버 (수정 없음)
 ```
+
+> **루트 `.env`**: `cube_perception`이 cwd 기준 `load_dotenv()`를 사용하므로 워크스페이스 루트에 `.env`(`GEMINI_API_KEY`, `GEMINI_MODEL`)를 두고 루트에서 실행하세요. `.env`는 `.gitignore`에 등록되어 커밋되지 않습니다.
 
 ---
 
@@ -161,20 +210,23 @@ src/
 | `DetectCubePose` | cube_perception | `string hint` → `PoseStamped pose, float32 confidence, bool success, string message` |
 | `ExtractFace` | cube_perception | `string face` → `string colors_9, bool success, string message` |
 | `GetCubeState` | cube_perception | (없음) → `string state_54, bool success, string message` |
-| `StartRun` | cube_orchestrator | (없음) → `bool success, string message` |
+| `StartRun` | cube_orchestrator | (없음) → `bool success, string message` (`skip_pickup` 옵션은 제거됨) |
 | `StartScan` | cube_orchestrator | (없음) → `bool success, string message, string state_54, string solution` |
 | `StartSolve` | cube_orchestrator | `string solution` → `bool success, string message` |
 
 ### Actions
 
-| 액션 | 패키지 | Goal / Result / Feedback |
+| 액션 | 정의 위치 (cube_interfaces) | Goal / Result / Feedback |
 |---|---|---|
-| `ExecuteSolveToken` | cube_robot_action | Goal: `string token` / Result: `bool success, string message` / Feedback: `string stage, float32 progress` |
-| `PickupCube` | cube_robot_action | Goal: `string step, PoseStamped cube_pose` / Result: `bool success, string message` / Feedback: `string stage` |
-| `PlaceOnJig` | cube_robot_action | Goal: `string step` / Result: `bool success, string message` / Feedback: `string stage` |
-| `GoHome` | cube_robot_action | Goal: (없음) / Result: `bool success, string message` |
-| `RotateCubeForFace` | cube_robot_action | Goal: `string next_face` / Result: `bool success` / Feedback: `string stage` |
-| `SafeGrasp` | rh_p12_rna_controller_interfaces | Goal: `int32 target_position, int32 goal_current, int32 current_threshold, float32 timeout_sec` / Result: `bool success, bool grasped, int32 final_position, int32 final_current, string message` |
+| `ExecuteSolveToken` | cube_robot_action/action | Goal: `string token` / Result: `bool success, string message` / Feedback: `string stage, float32 progress` |
+| `PickupCube` | cube_robot_action/action | Goal: `string step, PoseStamped cube_pose` / Result: `bool success, string message` / Feedback: `string stage` |
+| `PlaceOnJig` | cube_robot_action/action | Goal: `string step` / Result: `bool success, string message` / Feedback: `string stage` |
+| `GoHome` | cube_robot_action/action | Goal: (없음) / Result: `bool success, string message` |
+| `RotateCubeForFace` | cube_robot_action/action | Goal: `string next_face` / Result: `bool success` / Feedback: `string stage` |
+| `SafeGrasp` | rh_p12_rna_controller/action | Goal: `int32 target_position, int32 goal_current, int32 current_threshold, float32 timeout_sec` / Result: `bool success, bool grasped, int32 final_position, int32 final_current, string message` |
+| `GripperCommand` | rh_p12_rna_controller/action | (legacy) `gripper_node`이 호환 목적 노출 |
+
+> **모든 import는 `cube_interfaces.{action,srv,msg}` 형태로 통일.** 패키지 prefix(`from cube_orchestrator.srv import …`) 형태는 더 이상 사용하지 않습니다.
 
 ### Topics
 
@@ -294,27 +346,28 @@ PULSE_REPOSE = 420   # 재파지
 # 0. ROS2 Humble 소스
 source /opt/ros/humble/setup.bash
 
-# 1. pip 의존성
-pip install kociemba "uvicorn[standard]"
+# 1. pip 의존성 (rosdep으로 안 깔리는 패키지 — 자세한 설명은 위 "개발 환경" 섹션 참고)
+pip install kociemba google-genai python-dotenv fastapi "uvicorn[standard]" opencv-python numpy
 
 # 2. 빌드 (인터페이스 패키지 우선)
-colcon build --packages-select rh_p12_rna_controller_interfaces
+colcon build --packages-select cube_interfaces
 colcon build --packages-select \
     cube_perception cube_robot_action cube_orchestrator \
     rh_p12_rna_controller cube_webui
 source install/setup.bash
 
-# 3. 전체 스택 기동
-ros2 launch cube_orchestrator full_stack.launch.py
+# 3. 전체 스택 기동 (워크스페이스 루트에서 — .env 로드를 위해)
+ros2 launch cube_orchestrator full_stack.launch.py \
+    dsr_host:=110.120.1.40 dsr_port:=12345
 
 # 4a. Scan (감지 + 색상 인식 + 솔빙)
-ros2 service call /orchestrator/start_scan cube_orchestrator/srv/StartScan
+ros2 service call /cube_orchestrator/start_scan cube_interfaces/srv/StartScan "{}"
 
 # 4b. Solve (큐브 풀기, 캐시 또는 직접 solution 입력)
-ros2 service call /orchestrator/start_solve cube_orchestrator/srv/StartSolve "{solution: 'U R F2 ...'}"
+ros2 service call /cube_orchestrator/start_solve cube_interfaces/srv/StartSolve "{solution: 'U R F2 ...'}"
 
 # 4c. Run (scan + solve 연속)
-ros2 service call /orchestrator/start_run cube_orchestrator/srv/StartRun
+ros2 service call /cube_orchestrator/start_run cube_interfaces/srv/StartRun "{}"
 
 # 5. Web UI
 ros2 launch cube_webui webui.launch.py   # http://localhost:8080
@@ -326,7 +379,7 @@ ros2 launch cube_webui webui.launch.py   # http://localhost:8080
 
 | 항목 | 내용 |
 |---|---|
-| 그리퍼 전류 임계값 | GRIP_THRESHOLD_CLOSE=300mA, GRIP_GOAL_CURRENT=500mA — 실기 튜닝 필요 |
+| 그리퍼 전류 임계값 | `GRIP_THRESHOLD_CLOSE=300`mA, `GRIP_THRESHOLD_OPEN=9999` (position-only), `GRIP_GOAL_CURRENT=500`mA, `GRIP_TIMEOUT_SEC=8.0`s — 실기 튜닝 필요 |
 | `face_transition_sequence()` | 미구현 (빈 리스트 반환) — 면 전환 룩업테이블 채우기 필요 |
 | `time.sleep` in async | `_movel`/`_movej` 코루틴 내 `time.sleep(0.3)` → `asyncio.sleep`으로 교체 권장 |
 | `_call_action` timeout | `wait_for_server`·`send_goal`·`get_result` 세 단계가 동일 `timeout_sec` 사용 → 최악 3× 대기. 단계별 timeout 분리 권장 (`wait_for_server=5s`, `send_goal=5s`, `get_result=timeout_sec`) |

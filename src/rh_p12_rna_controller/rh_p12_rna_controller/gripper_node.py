@@ -149,14 +149,21 @@ def build_drl_move_and_poll(
         "\n"
         "__done = False\n"
         f"__loop = {max_loops}\n"
+        "__rb_fail = 0\n"
         "while not __done and __loop > 0:\n"
         "    __loop = __loop - 1\n"
         "    __cur = _read_cur()\n"
+        "    __pos = _read_pos()\n"
+        "    if __cur == -99999 and __pos == -99999:\n"
+        "        __rb_fail = __rb_fail + 1\n"
+        "        if __rb_fail >= 5:\n"
+        "            break\n"
+        "    else:\n"
+        "        __rb_fail = 0\n"
         "    if __cur != -99999:\n"
         f"        if abs(__cur) > {int(grip_current_threshold)}:\n"
         "            __done = True\n"
         "            break\n"
-        "    __pos = _read_pos()\n"
         "    if __pos != -99999:\n"
         f"        if __pos >= {int(target_pulse - pos_tolerance)} and __pos <= {int(target_pulse + pos_tolerance)}:\n"
         "            __done = True\n"
@@ -1390,7 +1397,7 @@ class GripperNode(Node):
             return
 
         waited = 0.0
-        while not self._cli_drl.service_is_ready() and waited < 5.0:
+        while not self._cli_drl.service_is_ready() and waited < 30.0:
             time.sleep(0.5)
             waited += 0.5
 
@@ -1419,7 +1426,7 @@ class GripperNode(Node):
                     ModbusRTU.fc06(self._slave_id, 256, 1),  # TORQUE_ENABLE
                     ModbusRTU.fc06(self._slave_id, 275, self._cur_init),  # GOAL_CURRENT
                 ]
-                if not self._call_drl(build_drl_write_packets(init_pkts), timeout_sec=5.0):
+                if not self._call_drl(build_drl_write_packets(init_pkts), timeout_sec=15.0):
                     self.get_logger().error("DRL 직접 초기화 실패(토크ON/기본전류)")
                 else:
                     self.get_logger().info("DRL 직접 초기화 완료(토크ON/기본전류)")

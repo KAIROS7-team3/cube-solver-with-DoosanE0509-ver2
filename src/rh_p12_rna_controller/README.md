@@ -5,24 +5,23 @@
 
 ---
 
-## 0) 패키지 구성(왜 2개인가?)
+## 0) 패키지 구성
 
-현재는 **두 개 패키지가 세트로 움직입니다.**
+> 본 워크스페이스(`cube-solver-with-DoosanE0509-ver2`)에서는 **모든 인터페이스가 통합 패키지 `cube_interfaces`(ament_cmake)로 이전**되었습니다. 즉 더 이상 별도 `rh_p12_rna_controller_interfaces` 패키지를 빌드하지 않습니다.
 
-### A) `rh_p12_rna_controller_interfaces`
-- **역할**: ROS 통신 “규격(계약/Contract)”만 정의
-- **포함(타입 정의)**:
-  - `msg/GripperState.msg`
-  - `srv/GetState.srv`
-  - `srv/SetPosition.srv`
-  - `action/SafeGrasp.action`
+### 인터페이스 (`cube_interfaces` 내부)
+- `rh_p12_rna_controller/msg/GripperState.msg`
+- `rh_p12_rna_controller/srv/GetState.srv`
+- `rh_p12_rna_controller/srv/SetPosition.srv`
+- `rh_p12_rna_controller/action/SafeGrasp.action`
+- `rh_p12_rna_controller/action/GripperCommand.action` (legacy)
 
-> 장점: 내부 구현(TCP/DRL/Modbus)이 바뀌어도 상위 노드는 API 계약만 보고 그대로 사용 가능.
+상위 노드 import는 `from cube_interfaces.action import SafeGrasp` 형태로 통일됩니다.
 
-### B) `rh_p12_rna_controller`
+### 구현 (`rh_p12_rna_controller`, ament_python)
 - **역할**: 실제 구현(Doosan DRL 주입, TCP 연결, Modbus RTU 프레임, 상태 publish, grasp 판정 등)
 - **실행 노드**:
-  - `gripper_service_node` (**권장 / TCP owner**)
+  - `gripper_service_node` (**권장 / TCP owner — `/gripper/safe_grasp` 액션 제공**)
   - `gripper_node` (기존 올인원 / 호환 목적)
 
 ---
@@ -183,6 +182,26 @@ sequenceDiagram
 
 ---
 
+## 2.7) 최근 timeout / readback 패치 (실기 안정화)
+
+dsr_bringup2 / DRL 폴링 지연으로 인한 false-failure를 줄이기 위한 패치가 적용되어 있습니다.
+
+### `gripper_node.py`
+- dsr_bringup2 `drl_start` 서비스 대기: **5s → 30s**
+- DRL 초기화 호출 timeout: **5s → 15s**
+- `build_drl_move_and_poll()` DRL 코드: readback **연속 실패 5회** 시 `break` (무한 루프 방지)
+
+### `gripper_service_node.py`
+- `_call_drl` 응답 대기 timeout: `max(5.0, timeout+3.0)` → **`max(60.0, timeout+5.0)`** (set_position 핸들러 + SafeGrasp 핸들러 양쪽)
+- `_build_drl_move_and_poll_for_service`에 `user_timeout` 인자 추가:
+  - `max_loops = int(user_timeout/0.85)+4` (8~80 클램프)로 동적 산출 → 사용자가 준 `timeout_sec`에 따라 폴링 윗바운드 자동 조정.
+
+### 사용 시 권장값
+- `SafeGrasp.timeout_sec`: **8s 이상** (그리퍼 동작 한계 시간; 너무 짧으면 success 판정 전에 끝남).
+- `cube_robot_action`의 `GRIP_TIMEOUT_SEC=8.0`이 이 권장값과 정합.
+
+---
+
 ## 3) 레지스터 기본 맵 (RH‑P12‑RN(A), bridge_compare 기준)
 
 - Goal:
@@ -199,13 +218,13 @@ sequenceDiagram
 
 ## 4) 터미널 1/2/3/4 실행 명령어
 
-> 아래는 예시 IP `110.120.1.40`, 포트 `9105` 기준입니다. 환경에 맞게 변경하세요.
+> 아래는 본 워크스페이스 기준 임시 테스트 IP `110.120.1.40`, 포트 `12345`(DRL TCP) 기준입니다. 환경에 맞게 변경하세요. 실제 본 워크스페이스 경로는 `~/cube-solver-with-DoosanE0509-ver2`이며, 다른 사람 환경에 그대로 두지 말고 자신의 경로로 바꿔주세요.
 
 ### 터미널 1) Doosan bringup
 
 ```bash
 source /opt/ros/$ROS_DISTRO/setup.bash
-source /home/kimsungyeoun/ros2_ws/install/setup.bash
+source ~/cube-solver-with-DoosanE0509-ver2/install/setup.bash
 
 ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py mode:=real model:=e0509 host:=110.120.1.40
 ```
@@ -214,9 +233,9 @@ ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py mode:=real model:=e0509 hos
 
 ```bash
 source /opt/ros/$ROS_DISTRO/setup.bash
-cd /home/kimsungyeoun/cube-solver-with-DoosanE0509-ver1/src
+cd ~/cube-solver-with-DoosanE0509-ver2
 
-colcon build --packages-select rh_p12_rna_controller_interfaces rh_p12_rna_controller
+colcon build --packages-select cube_interfaces rh_p12_rna_controller
 source install/setup.bash
 
 ros2 run rh_p12_rna_controller gripper_service_node --ros-args \
@@ -240,16 +259,16 @@ ros2 run rh_p12_rna_controller gripper_service_node --ros-args \
 
 ```bash
 source /opt/ros/$ROS_DISTRO/setup.bash
-cd /home/kimsungyeoun/cube-solver-with-DoosanE0509-ver1/src
+cd ~/cube-solver-with-DoosanE0509-ver2
 source install/setup.bash
 
-ros2 service call /gripper/get_state rh_p12_rna_controller_interfaces/srv/GetState "{}"
+ros2 service call /gripper/get_state cube_interfaces/srv/GetState "{}"
 ```
 
 목표 위치 이동:
 
 ```bash
-ros2 service call /gripper/set_position rh_p12_rna_controller_interfaces/srv/SetPosition \
+ros2 service call /gripper/set_position cube_interfaces/srv/SetPosition \
 "{position: 420, current: 300, timeout_sec: 5.0}"
 ```
 
@@ -259,10 +278,10 @@ SafeGrasp:
 
 ```bash
 source /opt/ros/$ROS_DISTRO/setup.bash
-cd /home/kimsungyeoun/cube-solver-with-DoosanE0509-ver1/src
+cd ~/cube-solver-with-DoosanE0509-ver2
 source install/setup.bash
 
-ros2 action send_goal /gripper/safe_grasp rh_p12_rna_controller_interfaces/action/SafeGrasp \
+ros2 action send_goal /gripper/safe_grasp cube_interfaces/action/SafeGrasp \
 "{target_position: 420, goal_current: 300, current_threshold: 50, timeout_sec: 8.0}" --feedback
 ```
 

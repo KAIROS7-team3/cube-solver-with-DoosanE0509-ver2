@@ -53,7 +53,7 @@ DR_MV_MOD_REL = 1
 GRIP_GOAL_CURRENT: int     = 500
 GRIP_THRESHOLD_CLOSE: int  = 300
 GRIP_THRESHOLD_OPEN: int   = 9999
-GRIP_TIMEOUT_SEC: float    = 5.0
+GRIP_TIMEOUT_SEC: float    = 8.0
 
 
 class RobotActionServerNode(Node):
@@ -77,22 +77,22 @@ class RobotActionServerNode(Node):
         self.cfg_tcp_cli = self.create_client(ConfigCreateTcp, f'{_p}/tcp/config_create_tcp', callback_group=self.cb_group)
         self.set_tcp_cli = self.create_client(SetCurrentTcp,   f'{_p}/tcp/set_current_tcp',   callback_group=self.cb_group)
         self.get_tcp_cli = self.create_client(GetCurrentTcp,   f'{_p}/tcp/get_current_tcp',   callback_group=self.cb_group)
-        self.drl_cli     = self.create_client(DrlStart,  '/drl/drl_start',                callback_group=self.cb_group)
+        self.drl_cli     = self.create_client(DrlStart,  f'{_p}/drl/drl_start',           callback_group=self.cb_group)
 
         self.grip_cli = ActionClient(self, SafeGrasp, '/gripper/safe_grasp', callback_group=self.cb_group)
 
         self._wait_for_services()
 
         # 5개 액션 서버 등록 (명세서 3.1)
-        ActionServer(self, ExecuteSolveToken,  'cube_robot_action/execute_solve_token',
+        ActionServer(self, ExecuteSolveToken,  '/robot/execute_solve_token',
                      execute_callback=self._exec_token_cb,  goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, PickupCube,         'cube_robot_action/pickup_cube',
+        ActionServer(self, PickupCube,         '/robot/pickup_cube',
                      execute_callback=self._pickup_cb,      goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, PlaceOnJig,         'cube_robot_action/place_on_jig',
+        ActionServer(self, PlaceOnJig,         '/robot/place_on_jig',
                      execute_callback=self._place_cb,       goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, GoHome,             'cube_robot_action/go_home',
+        ActionServer(self, GoHome,             '/robot/go_home',
                      execute_callback=self._home_cb,        goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, RotateCubeForFace,  'cube_robot_action/rotate_cube_for_face',
+        ActionServer(self, RotateCubeForFace,  '/robot/rotate_cube_for_face',
                      execute_callback=self._rotate_face_cb, goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
 
         self._tcp_ready = False
@@ -106,11 +106,11 @@ class RobotActionServerNode(Node):
             (self.movel_cli,   'move_line'), (self.movej_cli, 'move_joint'),
             (self.stop_cli,    'move_stop'), (self.drl_cli,   'drl_start'),
         ]:
-            if not cli.wait_for_service(timeout_sec=5.0):
+            if not cli.wait_for_service(timeout_sec=15.0):
                 self.get_logger().error(f'❌ {name} 없음')
             else:
                 self.get_logger().info(f'✅ {name} 연결됨')
-        if not self.grip_cli.wait_for_server(timeout_sec=5.0):
+        if not self.grip_cli.wait_for_server(timeout_sec=15.0):
             self.get_logger().error('❌ /gripper/safe_grasp 액션 서버 없음')
         else:
             self.get_logger().info('✅ /gripper/safe_grasp 연결됨')
