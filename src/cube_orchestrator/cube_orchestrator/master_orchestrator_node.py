@@ -26,6 +26,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from cube_interfaces.srv import StartRun, StartScan, StartSolve
+from dsr_msgs2.srv import MoveStop
 
 try:
     import kociemba  # type: ignore
@@ -62,11 +63,21 @@ class MasterOrchestratorNode(Node):
         self.declare_parameter("service_timeout_sec", 10.0)
         self.declare_parameter("action_timeout_sec", 120.0)
         self.declare_parameter("perceive_action_timeout_sec", 30.0)
+        # perception 서비스(외부 API 호출 포함)는 결과 수신까지 매우 오래 걸릴 수 있음
+        self.declare_parameter("perceive_service_timeout_sec", 600.0)
+        self.declare_parameter("robot_ns", "dsr01")
+        self._robot_ns = (
+            self.get_parameter("robot_ns").get_parameter_value().string_value
+        )
+        _rp = f"/{self._robot_ns}" if self._robot_ns else ""
 
         self._svc_timeout = float(self.get_parameter("service_timeout_sec").value)
         self._act_timeout = float(self.get_parameter("action_timeout_sec").value)
         self._perceive_act_timeout = float(
             self.get_parameter("perceive_action_timeout_sec").value
+        )
+        self._perceive_svc_timeout = float(
+            self.get_parameter("perceive_service_timeout_sec").value
         )
 
         # ---- runtime state ----
@@ -123,6 +134,15 @@ class MasterOrchestratorNode(Node):
             Trigger, "/orchestrator/cancel",
             self._cancel_cb, callback_group=self._cb_group,
         )
+        self._estop_srv = self.create_service(
+            Trigger, "/orchestrator/emergency_stop",
+            self._emergency_stop_cb, callback_group=self._cb_group,
+        )
+
+        # ---- emergency stop client (Doosan move_stop) ----
+        self._move_stop_cli = self.create_client(
+            MoveStop, f"{_rp}/motion/move_stop", callback_group=self._cb_group,
+        )
 
         # ---- service clients (cube_perception) ----
         self._detect_cli = self.create_client(
@@ -157,12 +177,15 @@ class MasterOrchestratorNode(Node):
             self, GoHome, "/robot/go_home", callback_group=self._cb_group
         )
 
+        # upstream ready gate: True가 되기 전까지 start_* 콜백이 reject
+        self._upstream_ready = False
+
         # ---- worker thread ----
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
         self._pub_state("IDLE")
-        self.get_logger().info("master_orchestrator_node ready")
+        self.get_logger().info("master_orchestrator_node ready (upstream 대기 중)")
 
     # ------------------------------------------------------------------
     # Service callbacks
@@ -171,6 +194,10 @@ class MasterOrchestratorNode(Node):
         self, req: StartRun.Request, res: StartRun.Response
     ) -> StartRun.Response:
         """기존 동작 유지: 분기 1 + 분기 2를 순차 실행. fire-and-forget."""
+        if not self._upstream_ready:
+            res.success = False
+            res.message = "upstream not ready — please retry in a moment"
+            return res
         with self._busy_lock:
             if self._busy:
                 res.success = False
@@ -189,6 +216,10 @@ class MasterOrchestratorNode(Node):
         self, req: StartScan.Request, res: StartScan.Response
     ) -> StartScan.Response:
         """분기 1 실행 후 블로킹 대기. 응답에 state_54 + solution 포함."""
+        if not self._upstream_ready:
+            res.success = False
+            res.message = "upstream not ready — please retry in a moment"
+            return res
         with self._busy_lock:
             if self._busy:
                 res.success = False
@@ -215,6 +246,10 @@ class MasterOrchestratorNode(Node):
         self, req: StartSolve.Request, res: StartSolve.Response
     ) -> StartSolve.Response:
         """분기 2 실행 후 블로킹 대기. req.solution이 비어 있으면 캐시 사용."""
+        if not self._upstream_ready:
+            res.success = False
+            res.message = "upstream not ready — please retry in a moment"
+            return res
         tokens: Optional[list[str]] = None
         if req.solution.strip():
             tokens = [t for t in req.solution.strip().split() if t]
@@ -264,10 +299,95 @@ class MasterOrchestratorNode(Node):
         res.message = "cancel requested"
         return res
 
+    def _emergency_stop_cb(
+        self, req: Trigger.Request, res: Trigger.Response
+    ) -> Trigger.Response:
+        """비상 정지: Doosan move_stop(stop_mode=1) 즉시 호출 + FSM cancel + FAULT 전이.
+
+        호출 흐름:
+          1. /dsr01/motion/move_stop 서비스 즉시 호출 (stop_mode=1, quick stop)
+          2. _cancel_event 세트 → 진행 중 step 다음 분기에서 FAULT 전이
+          3. 현재 액션 goal handle이 있으면 cancel_goal_async 시도
+          4. 상태 FAULT 발행
+        """
+        self.get_logger().error("🛑 EMERGENCY STOP requested")
+        stop_ok = False
+        stop_msg = ""
+        try:
+            if self._move_stop_cli.service_is_ready() or self._move_stop_cli.wait_for_service(timeout_sec=1.0):
+                stop_req = MoveStop.Request()
+                stop_req.stop_mode = 1  # quick stop
+                # 비동기 호출 — 응답 대기 없이 즉시 반환
+                self._move_stop_cli.call_async(stop_req)
+                stop_ok = True
+                stop_msg = "move_stop dispatched"
+            else:
+                stop_msg = f"{self._move_stop_cli.srv_name} not available"
+                self.get_logger().error(f"  ❌ {stop_msg}")
+        except Exception as exc:  # pragma: no cover
+            stop_msg = f"move_stop raised: {exc}"
+            self.get_logger().error(f"  ❌ {stop_msg}")
+
+        # FSM 취소 신호 + 진행 중 goal cancel
+        self._cancel_event.set()
+        with self._goal_handle_lock:
+            handle = self._current_goal_handle
+        if handle is not None:
+            try:
+                handle.cancel_goal_async()
+            except Exception as exc:  # pragma: no cover
+                self.get_logger().warn(f"cancel_goal_async raised: {exc}")
+
+        # FAULT 상태 발행
+        try:
+            self._pub_state("FAULT")
+            fault = String()
+            fault.data = "emergency_stop"
+            self._fault_pub.publish(fault)
+        except Exception:  # pragma: no cover
+            pass
+
+        res.success = stop_ok
+        res.message = f"emergency_stop: {stop_msg}"
+        return res
+
     # ------------------------------------------------------------------
     # Worker loop
     # ------------------------------------------------------------------
+    def _wait_for_upstreams(self, timeout_sec: float = 120.0) -> None:
+        """업스트림 액션 서버 / 서비스 클라이언트가 준비될 때까지 대기.
+        완료되면 self._upstream_ready = True.  호출자: _worker_loop 시작 직후."""
+        self.get_logger().info("⏳ upstream 연결 대기 중 (최대 %.0fs)…" % timeout_sec)
+        action_clients = [
+            ("/robot/pickup_cube",         self._pickup_act),
+            ("/robot/place_on_jig",        self._place_act),
+            ("/robot/rotate_cube_for_face",self._rotate_act),
+            ("/robot/execute_solve_token", self._token_act),
+            ("/robot/go_home",             self._home_act),
+        ]
+        service_clients = [
+            ("/cube_perception/detect_cube_pose", self._detect_cli),
+            ("/cube_perception/extract_face",     self._extract_cli),
+            ("/cube_perception/get_cube_state",   self._get_state_cli),
+        ]
+        for name, cli in action_clients:
+            ok = cli.wait_for_server(timeout_sec=timeout_sec)
+            if ok:
+                self.get_logger().info(f"  ✅ {name}")
+            else:
+                self.get_logger().warn(f"  ⚠️  {name} 대기 타임아웃 — 계속 진행")
+        for name, cli in service_clients:
+            ok = cli.wait_for_service(timeout_sec=timeout_sec)
+            if ok:
+                self.get_logger().info(f"  ✅ {name}")
+            else:
+                self.get_logger().warn(f"  ⚠️  {name} 대기 타임아웃 — 계속 진행")
+        self._upstream_ready = True
+        self._pub_state("IDLE")
+        self.get_logger().info("✅ upstream 준비 완료 — 명령 수신 가능")
+
     def _worker_loop(self) -> None:
+        self._wait_for_upstreams()
         while rclpy.ok():
             if not self._start_event.wait(timeout=0.5):
                 continue
@@ -415,7 +535,7 @@ class MasterOrchestratorNode(Node):
     def _run_detect(self) -> bool:
         req = DetectCubePose.Request()
         req.hint = "workspace"
-        res = self._call_service(self._detect_cli, req, self._svc_timeout)
+        res = self._call_service(self._detect_cli, req, self._perceive_svc_timeout)
         if res is None or not res.success:
             msg = getattr(res, "message", "no response") if res else "timeout"
             self.get_logger().error(f"DetectCubePose failed: {msg}")
@@ -475,7 +595,7 @@ class MasterOrchestratorNode(Node):
     def _run_extract(self, face: str) -> bool:
         req = ExtractFace.Request()
         req.face = face
-        res = self._call_service(self._extract_cli, req, self._svc_timeout)
+        res = self._call_service(self._extract_cli, req, self._perceive_svc_timeout)
         if res is None or not res.success:
             msg = getattr(res, "message", "no response") if res else "timeout"
             self.get_logger().error(f"ExtractFace({face}) failed: {msg}")
@@ -487,7 +607,7 @@ class MasterOrchestratorNode(Node):
     def _run_solve(self) -> tuple[Optional[list[str]], str]:
         """GetCubeState → kociemba. Returns (tokens, state_54); tokens=None on failure."""
         res = self._call_service(
-            self._get_state_cli, GetCubeState.Request(), self._svc_timeout
+            self._get_state_cli, GetCubeState.Request(), self._perceive_svc_timeout
         )
         if res is None or not res.success:
             msg = getattr(res, "message", "no response") if res else "timeout"
@@ -530,19 +650,53 @@ class MasterOrchestratorNode(Node):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _call_service(self, client, request, timeout_sec: float):
-        if not client.wait_for_service(timeout_sec=timeout_sec):
+    def _call_service(
+        self,
+        client,
+        request,
+        timeout_sec: float,
+        connect_timeout_sec: float = 5.0,
+    ):
+        """Call a ROS2 service synchronously.
+
+        - `connect_timeout_sec`: max wait for service to become available (server-side discovery).
+        - `timeout_sec`: max wait for the result *after* the call has been dispatched.
+          Long-running RPCs (e.g. external API calls) should pass a generous value here.
+          During the wait, ``self._cancel_event`` is polled so emergency_stop / cancel
+          can abort the wait promptly.
+        """
+        if not client.wait_for_service(timeout_sec=connect_timeout_sec):
             self.get_logger().error(f"service unavailable: {client.srv_name}")
             return None
         future = client.call_async(request)
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
-        if not done.wait(timeout=timeout_sec):
-            self.get_logger().error(
-                f"service timeout ({timeout_sec}s): {client.srv_name}"
-            )
-            return None
-        return future.result()
+
+        # Poll cancel_event during long waits so abort is responsive.
+        poll_step = 0.5
+        elapsed = 0.0
+        while elapsed < timeout_sec:
+            if done.wait(timeout=poll_step):
+                return future.result()
+            if self._cancel_event.is_set():
+                try:
+                    client.remove_pending_request(future)
+                except Exception:  # pragma: no cover
+                    pass
+                self.get_logger().warn(
+                    f"service cancelled: {client.srv_name}"
+                )
+                return None
+            elapsed += poll_step
+
+        self.get_logger().error(
+            f"service timeout ({timeout_sec}s): {client.srv_name}"
+        )
+        try:
+            client.remove_pending_request(future)
+        except Exception:  # pragma: no cover
+            pass
+        return None
 
     def _call_action(
         self,

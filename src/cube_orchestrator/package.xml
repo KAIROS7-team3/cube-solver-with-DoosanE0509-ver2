@@ -12,6 +12,7 @@
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>cube_interfaces</exec_depend>
+  <exec_depend>dsr_msgs2</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <!-- kociemba: pip install kociemba -->

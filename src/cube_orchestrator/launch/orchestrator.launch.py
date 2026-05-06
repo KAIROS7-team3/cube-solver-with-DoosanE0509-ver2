@@ -14,6 +14,9 @@ def generate_launch_description() -> LaunchDescription:
     perceive_action_timeout_arg = DeclareLaunchArgument(
         "perceive_action_timeout_sec", default_value="30.0"
     )
+    perceive_service_timeout_arg = DeclareLaunchArgument(
+        "perceive_service_timeout_sec", default_value="600.0"
+    )
 
     orchestrator_node = Node(
         package="cube_orchestrator",
@@ -27,6 +30,9 @@ def generate_launch_description() -> LaunchDescription:
                 "perceive_action_timeout_sec": LaunchConfiguration(
                     "perceive_action_timeout_sec"
                 ),
+                "perceive_service_timeout_sec": LaunchConfiguration(
+                    "perceive_service_timeout_sec"
+                ),
             }
         ],
     )
@@ -36,6 +42,7 @@ def generate_launch_description() -> LaunchDescription:
             service_timeout_arg,
             action_timeout_arg,
             perceive_action_timeout_arg,
+            perceive_service_timeout_arg,
             orchestrator_node,
         ]
     )

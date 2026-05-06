@@ -38,6 +38,7 @@ def generate_launch_description() -> LaunchDescription:
     service_timeout_sec = LaunchConfiguration("service_timeout_sec")
     action_timeout_sec = LaunchConfiguration("action_timeout_sec")
     perceive_action_timeout_sec = LaunchConfiguration("perceive_action_timeout_sec")
+    perceive_service_timeout_sec = LaunchConfiguration("perceive_service_timeout_sec")
 
     # ① Doosan 드라이버 (doosan-robot2 저장소 별도 클론 필요)
     dsr_launch = IncludeLaunchDescription(
@@ -118,13 +119,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="robot_action_server_node",
         name="robot_action_server_node",
         output="screen",
-        remappings=[
-            ("cube_robot_action/pickup_cube", "/robot/pickup_cube"),
-            ("cube_robot_action/place_on_jig", "/robot/place_on_jig"),
-            ("cube_robot_action/rotate_cube_for_face", "/robot/rotate_cube_for_face"),
-            ("cube_robot_action/execute_solve_token", "/robot/execute_solve_token"),
-            ("cube_robot_action/go_home", "/robot/go_home"),
-        ],
+        parameters=[{"robot_ns": "dsr01"}],
     )
 
     orchestrator_node = Node(
@@ -137,6 +132,7 @@ def generate_launch_description() -> LaunchDescription:
                 "service_timeout_sec": service_timeout_sec,
                 "action_timeout_sec": action_timeout_sec,
                 "perceive_action_timeout_sec": perceive_action_timeout_sec,
+                "perceive_service_timeout_sec": perceive_service_timeout_sec,
             }
         ],
     )
@@ -163,6 +159,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("service_timeout_sec", default_value="10.0"),
             DeclareLaunchArgument("action_timeout_sec", default_value="120.0"),
             DeclareLaunchArgument("perceive_action_timeout_sec", default_value="30.0"),
+            DeclareLaunchArgument("perceive_service_timeout_sec", default_value="600.0"),
             dsr_launch,
             gripper_node,
             realsense_launch,
