@@ -85,8 +85,13 @@ ros2 action send_goal /robot/go_home cube_interfaces/action/GoHome "{}"
 
 자세한 호출 예는 [`docs/TEST_COMMANDS.md`](../../docs/TEST_COMMANDS.md) §3-2 참고.
 
-## 알려진 TODO
+## 알려진 제한사항 및 TODO
 
+- **큐브 지그(ZIG) 위치 고정 좌표 하드코딩** — `motion_library.py` 상단의 웨이포인트 상수들이 base frame 절대 좌표로 박혀 있다. 지그/카메라/워크스테이션 위치를 물리적으로 옮기면 코드 수정 + 재빌드가 필요하다. 향후 yaml 파라미터로 분리 권장.
+  - `INITIAL_STATE = [373.030, 0.000, 74.660, 22.85, -180.0, 22.85]` — 지그 기준 자세 (ZIG_HOME).
+  - `L_DROP_POS`, `R_DROP_POS` — 솔빙 토큰 실행 시 좌/우 드롭 위치.
+  - `READY_D_LOW`, `READY_D_UP`, `CUBE_SCAN_B`, `CUBE_SCAN_D` — 면 캡처용 자세.
+  - `WORKSTATION_GRIP_Z = 13.71` — 워크스테이션 픽업 시 그리퍼 Z 높이.
 - `face_transition_sequence()` 빈 구현 — 면 전환 룩업테이블 채우기 필요.
 - 코루틴 안의 `time.sleep(0.3)` → `asyncio.sleep`으로 교체 권장.
 - `_call_action`의 `wait_for_server` / `send_goal` / `get_result` 단계별 timeout 분리 필요.
