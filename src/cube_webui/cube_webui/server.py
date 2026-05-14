@@ -237,7 +237,8 @@ class WebUIBridge(Node):
             "solution": res.solution,
         }
 
-    def call_solve(self, solution: str = "", timeout: float = 600.0) -> dict[str, Any]:
+    def call_solve(self, solution: str = "") -> dict[str, Any]:
+        """start_solve 는 토큰 실행 완료까지 무제한 대기 (cancel 버튼으로 중단 가능)."""
         if not self._solve_cli.wait_for_service(timeout_sec=5.0):
             return {"success": False, "message": "start_solve service unavailable"}
         req = StartSolve.Request()
@@ -245,8 +246,7 @@ class WebUIBridge(Node):
         future = self._solve_cli.call_async(req)
         done = threading.Event()
         future.add_done_callback(lambda _f: done.set())
-        if not done.wait(timeout=timeout):
-            return {"success": False, "message": "start_solve timeout"}
+        done.wait(timeout=None)  # 무제한 대기 — orchestrator 가 완료/실패/취소 시 응답
         res = future.result()
         return {"success": bool(res.success), "message": res.message}
 

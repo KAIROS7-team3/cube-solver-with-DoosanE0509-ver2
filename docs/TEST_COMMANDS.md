@@ -99,7 +99,7 @@ ros2 topic echo /orchestrator/fault
 
 ```bash
 cd ~/cube-solver-with-DoosanE0509-ver2
-ros2 run cube_webui server
+ros2 run cube_webui webui_server
 # 브라우저: http://localhost:8080
 ```
 
@@ -146,40 +146,37 @@ ros2 launch dsr_bringup2 dsr_bringup2.launch.py \
 ros2 run cube_robot_action robot_action_server_node
 ```
 
-별도 터미널에서 호출 (단독 실행 시 액션 이름은 **네이티브** `cube_robot_action/...`):
+별도 터미널에서 호출 (액션 이름은 단독/통합 모두 `/robot/...` — `robot_action_server_node`가 직접 등록하며 remap이 없다):
 
 ```bash
 # 홈 자세
-ros2 action send_goal /cube_robot_action/go_home \
+ros2 action send_goal /robot/go_home \
   cube_interfaces/action/GoHome "{}"
 
 # 면 회전 자세 (B / R / F / L / D / B_AGAIN)
-ros2 action send_goal /cube_robot_action/rotate_cube_for_face \
+ros2 action send_goal /robot/rotate_cube_for_face \
   cube_interfaces/action/RotateCubeForFace "{next_face: 'B'}"
 
 # 픽업 step별 (RELEASE_HOME → DESCEND → GRIP → LIFT 순서)
-ros2 action send_goal /cube_robot_action/pickup_cube \
+ros2 action send_goal /robot/pickup_cube \
   cube_interfaces/action/PickupCube "{step: 'RELEASE_HOME'}"
-ros2 action send_goal /cube_robot_action/pickup_cube \
+ros2 action send_goal /robot/pickup_cube \
   cube_interfaces/action/PickupCube "{step: 'DESCEND'}"
-ros2 action send_goal /cube_robot_action/pickup_cube \
+ros2 action send_goal /robot/pickup_cube \
   cube_interfaces/action/PickupCube "{step: 'GRIP'}"
-ros2 action send_goal /cube_robot_action/pickup_cube \
+ros2 action send_goal /robot/pickup_cube \
   cube_interfaces/action/PickupCube "{step: 'LIFT'}"
 
 # 지그 안착 (APPROACH → RELEASE)
-ros2 action send_goal /cube_robot_action/place_on_jig \
+ros2 action send_goal /robot/place_on_jig \
   cube_interfaces/action/PlaceOnJig "{step: 'APPROACH'}"
-ros2 action send_goal /cube_robot_action/place_on_jig \
+ros2 action send_goal /robot/place_on_jig \
   cube_interfaces/action/PlaceOnJig "{step: 'RELEASE'}"
 
 # 풀이 토큰 1개
-ros2 action send_goal /cube_robot_action/execute_solve_token \
+ros2 action send_goal /robot/execute_solve_token \
   cube_interfaces/action/ExecuteSolveToken "{token: 'F'}"
 ```
-
-> **주의**: full_stack 런치를 함께 띄우면 위 액션들은 `/robot/...`로 remap 되어 있습니다.
-> 단독 실행 = 네이티브 이름, 통합 실행 = `/robot/...` — 둘은 호환되지 않습니다.
 
 ### 3-3. perception 단독
 
@@ -236,9 +233,85 @@ ros2 run rqt_image_view rqt_image_view     # /cube_perception/debug/image
 | `GEMINI_API_KEY is not set` | `.env`가 cwd 기준에 없음 → 워크스페이스 루트에서 실행하거나 `export GEMINI_API_KEY=...` |
 | `DRL 서비스 연결 실패` | dsr_bringup2가 늦게 뜸. 그리퍼 노드는 30s 대기 후 포기 — full_stack launch 먼저 안정화 후 그리퍼 단독 실행 |
 | 그리퍼 액션 success=false인데 물리 동작 OK | DRL 폴링 readback이 늦거나 실패. 이미 `_call_drl` 60s + readback fail-break + max_loops 동적화 적용됨 — `timeout_sec`을 8s 이상으로 |
-| `/robot/...` 액션 wait 무한대기 | 단독 실행 중인데 remap 이름으로 호출. 네이티브 이름 `cube_robot_action/...` 사용하거나 full_stack launch 사용 |
+| `/robot/...` 액션 wait 무한대기 | `robot_action_server_node`가 안 떠 있거나 액션 이름 오타. 옛 `cube_robot_action/...` 경로는 더 이상 존재하지 않음 — `ros2 action list \| grep robot`로 실제 이름 확인 |
 | `failed to create symbolic link ... Is a directory` | `rm -rf build/<pkg> install/<pkg>` 후 재빌드 |
 | RotateCubeForFace 시퀀스 멈춤 | 대상 토큰의 직전 step이 안 끝났는지 확인 — orchestrator FSM 로그 보기 |
+| 특이점/충돌 비상정지 후 모션 서비스가 거부됨 | 로봇이 SAFE_STOP / SAFE_OFF 상태. 아래 §5-1 복귀 절차 참고 |
+
+### 5-1. 특이점·SAFE_STOP 복귀 절차
+
+`MOVE_L` 도중 손목/엘보 특이점, 충돌 토크 임계 초과 등으로 로봇이 SAFE_STOP 상태에 들어가면 `dsr_msgs2` 모션 서비스가 거부된다. 코드 변경 없이 ROS2 서비스 한두 줄로 복귀 가능 (네임스페이스는 통합런치 기본인 `dsr01` 기준).
+
+#### (1) 현재 상태 확인
+
+```bash
+ros2 service call /dsr01/system/get_robot_state \
+  dsr_msgs2/srv/GetRobotState "{}"
+```
+
+응답의 `robot_state` 가 `STATE_SAFE_STOP` 인지, 더 깊은 `STATE_SAFE_STOP2` / `STATE_SAFE_OFF` 인지 확인.
+
+#### (2) 가벼운 SAFE_STOP — 한 줄 복귀
+
+특이점/소프트리밋으로 인한 일반적인 SAFE_STOP 은 `RESET_SAFET_STOP` 한 번이면 STANDBY 로 복귀.
+
+```bash
+ros2 service call /dsr01/system/set_robot_control \
+  dsr_msgs2/srv/SetRobotControl "{robot_control: 2}"   # CONTROL_RESET_SAFET_STOP
+```
+
+복귀 후엔 `MoveJoint` 등으로 안전 자세까지 직접 이동 (`/dsr01/motion/move_joint` 또는 `cube_robot_action`의 `/robot/go_home`).
+
+#### (3) SAFE_STOP2 / SAFE_OFF — Recovery 모드 (= "안전모드") 3단계
+
+충돌·SAFE_OFF 까지 빠진 경우 한 번에 안 풀린다. 저속 단일관절 이동만 허용되는 Recovery 모드로 진입해 특이점 밖으로 살짝 뺀 뒤 STANDBY 로 복귀.
+
+```bash
+# 1) Recovery 진입
+ros2 service call /dsr01/system/set_robot_control \
+  dsr_msgs2/srv/SetRobotControl "{robot_control: 4}"   # CONTROL_RECOVERY_SAFE_STOP
+#   - SAFE_OFF 였으면 5: CONTROL_RECOVERY_SAFE_OFF
+
+# (또는) 명시적 모드 전환
+ros2 service call /dsr01/system/set_safety_mode \
+  dsr_msgs2/srv/SetSafetyMode "{safety_mode: 2, safety_event: 0}"   # RECOVERY + ENTER
+
+# 2) RViz/TP/movej 로 관절을 특이점 밖으로 이동
+#    (Recovery 모드에서는 저속·단일관절 이동만 허용됨)
+
+# 3) Recovery 종료 → STANDBY 복귀
+ros2 service call /dsr01/system/set_robot_control \
+  dsr_msgs2/srv/SetRobotControl "{robot_control: 7}"   # CONTROL_RESET_RECOVERY
+```
+
+#### (4) 보조 — 모드 토글
+
+```bash
+# AUTONOMOUS / MANUAL 토글 (자동운전 ↔ 수동)
+ros2 service call /dsr01/system/set_robot_mode \
+  dsr_msgs2/srv/SetRobotMode "{robot_mode: 1}"   # 0=MANUAL, 1=AUTONOMOUS, 2=MEASURE
+```
+
+#### `robot_control` 값 매핑 (참고)
+
+| 값 | 상수 | 전환 |
+|---|---|---|
+| 0 | CONTROL_INIT_CONFIG | NOT_READY → INITIALIZING (TP 전용) |
+| 1 | CONTROL_ENABLE_OPERATION | INITIALIZING → STANDBY (TP 전용) |
+| **2** | **CONTROL_RESET_SAFET_STOP** | **SAFE_STOP → STANDBY** ← 가장 흔함 |
+| 3 | CONTROL_RESET_SAFET_OFF | SAFE_OFF → STANDBY |
+| 4 | CONTROL_RECOVERY_SAFE_STOP | SAFE_STOP2 → RECOVERY |
+| 5 | CONTROL_RECOVERY_SAFE_OFF | SAFE_OFF2 → RECOVERY |
+| 6 | CONTROL_RECOVERY_BACKDRIVE | H/W backdrive (전원 재부팅 필요) |
+| 7 | CONTROL_RESET_RECOVERY | RECOVERY → STANDBY |
+
+#### `safety_mode` 값 (참고)
+
+`0=MANUAL, 1=AUTONOMOUS, 2=RECOVERY, 3=BACKDRIVE, 4=MEASURE, 5=INITIALIZE`
+
+> **권장 흐름**: (1) `get_robot_state` → (2) SAFE_STOP 이면 `SetRobotControl 2` → 안 풀리면 (3) `SetRobotControl 4` → movej로 특이점 회피 → `SetRobotControl 7`. 이래도 안 되면 TP 에서 직접(전원 재부팅·backdrive까지).
+>
+> 해당 시퀀스의 자동화는 별건 — 현 시점에서는 코드 변경 없이 운영자가 위 명령을 직접 호출하는 방식만 지원한다.
 
 ---
 

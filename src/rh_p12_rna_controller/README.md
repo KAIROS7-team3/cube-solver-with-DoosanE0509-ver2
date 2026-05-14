@@ -39,7 +39,7 @@ flowchart LR
     SET["/gripper/set_position\n(SetPosition.srv)"]
     SG["/gripper/safe_grasp\n(SafeGrasp.action)"]
     STATE["/gripper/state\n(JointState, SensorDataQoS)"]
-    IFACE["rh_p12_rna_controller_interfaces\n(msg/srv/action contract)"]
+    IFACE["cube_interfaces\n(msg/srv/action contract)"]
   end
 
   subgraph OWNER["Owner node (single bridge owner)"]
@@ -83,7 +83,7 @@ flowchart LR
   - “안전 파지(닫기+전류 판정)” → `/gripper/safe_grasp`
 
 ### B) API 계층(interfaces 패키지)
-- `rh_p12_rna_controller_interfaces`가 제공하는 타입이 “사용자/상위노드”의 기준이 됩니다.
+- `cube_interfaces`(통합 패키지)의 타입이 "사용자/상위노드"의 기준이 됩니다.
 - 내부 구현이 JSON→binary로 바뀌거나, watchdog이 바뀌어도 API는 유지됩니다.
 
 ### C) Owner 노드: `gripper_service_node`

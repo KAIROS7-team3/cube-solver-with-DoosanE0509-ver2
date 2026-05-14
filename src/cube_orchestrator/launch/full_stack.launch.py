@@ -39,6 +39,7 @@ def generate_launch_description() -> LaunchDescription:
     action_timeout_sec = LaunchConfiguration("action_timeout_sec")
     perceive_action_timeout_sec = LaunchConfiguration("perceive_action_timeout_sec")
     perceive_service_timeout_sec = LaunchConfiguration("perceive_service_timeout_sec")
+    gripper_verbose = LaunchConfiguration("gripper_verbose")
 
     # ① Doosan 드라이버 (doosan-robot2 저장소 별도 클론 필요)
     dsr_launch = IncludeLaunchDescription(
@@ -61,13 +62,23 @@ def generate_launch_description() -> LaunchDescription:
     # ② RH-P12-RN(A) 그리퍼 노드 → /gripper/safe_grasp 제공
     # gripper_service_node = GripperNode 상속 → SafeGrasp + GripperCommand 모두 제공
     # robot_ip: Doosan 컨트롤러 IP — dsr_host와 동일해야 함
+    # command_transport=tcp:
+    #   기본값 'drl'은 매 명령마다 drl_start만 호출하고 TCP 서버를 주입하지 않아
+    #   readback(_recv_loop)이 안 돌고 _current_hz_pos가 0으로 고정됨.
+    #   'tcp'로 두면 DRL TCP 서버 주입 + 9000 포트 접속 + 실시간 state 수신.
     gripper_node = Node(
         package="rh_p12_rna_controller",
         executable="gripper_service_node",
         name="gripper_service_node",
         output="screen",
         condition=IfCondition(use_gripper),
-        parameters=[{"robot_ip": dsr_host}],
+        parameters=[{
+            "robot_ip": dsr_host,
+            "command_transport": "tcp",
+            # 기본 false — 시끄러운 매 프레임 state readback만 DEBUG로 숨기고 나머지 로그는 그대로.
+            # `gripper_verbose:=true`로 readback까지 전부 노출 (디버깅용).
+            "verbose": gripper_verbose,
+        }],
     )
 
     # ③ RealSense D455 카메라
@@ -83,19 +94,28 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments={"align_depth.enable": "true"}.items(),
     )
 
+    # 카메라→base 외부 캘리브레이션은 yaml로 분리 (cube_perception/config/calibration.yaml)
+    # — 캘리브레이션 갱신 시 yaml만 수정하면 되도록.
+    calibration_yaml = os.path.join(
+        get_package_share_directory("cube_perception"),
+        "config",
+        "calibration.yaml",
+    )
+
     vla_node = Node(
         package="cube_perception",
         executable="vla_detection_node",
         name="vla_detection_node",
         output="screen",
         parameters=[
+            calibration_yaml,
             {
                 "color_image_topic": color_image_topic,
                 "depth_image_topic": depth_image_topic,
                 "camera_info_topic": camera_info_topic,
                 "depth_unit_scale": depth_unit_scale,
                 "depth_sample_radius_px": depth_sample_radius_px,
-            }
+            },
         ],
         remappings=[
             ("detect_cube_pose", "/cube_perception/detect_cube_pose"),
@@ -157,9 +177,15 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("depth_unit_scale", default_value="0.001"),
             DeclareLaunchArgument("depth_sample_radius_px", default_value="2"),
             DeclareLaunchArgument("service_timeout_sec", default_value="10.0"),
-            DeclareLaunchArgument("action_timeout_sec", default_value="120.0"),
-            DeclareLaunchArgument("perceive_action_timeout_sec", default_value="30.0"),
+            DeclareLaunchArgument("action_timeout_sec", default_value="180.0"),
+            DeclareLaunchArgument("perceive_action_timeout_sec", default_value="60.0"),
             DeclareLaunchArgument("perceive_service_timeout_sec", default_value="600.0"),
+            DeclareLaunchArgument(
+                "gripper_verbose",
+                default_value="false",
+                description="true면 그리퍼 매 프레임 state readback(DBG cur=…)까지 표시. "
+                            "false(기본)는 그것만 숨기고 시작/명령/접속 INFO는 그대로 노출.",
+            ),
             dsr_launch,
             gripper_node,
             realsense_launch,

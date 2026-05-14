@@ -1531,7 +1531,9 @@ class GripperNode(Node):
                             self._tcp_pong_seen = True
                             self._tcp_hello_seen = True
                             self._last_pong_rx_t = time.time()
-                            self.get_logger().info("TCP pong 수신 (프로토콜 OK)")
+                            # 매 핑 주기마다 찍히는 노이즈 — DEBUG로 강등.
+                            # 통합런치 기본(verbose=False)에서는 숨고, gripper_verbose:=true 시에만 노출.
+                            self.get_logger().debug("TCP pong 수신 (프로토콜 OK)")
                         elif mtype == TCP_T_ACK:
                             ok = bool(payload[0]) if len(payload) >= 1 else False
                             err = ""
@@ -1582,7 +1584,9 @@ class GripperNode(Node):
                             self._tcp_pong_seen = True
                             self._tcp_hello_seen = True
                             self._last_pong_rx_t = time.time()
-                            self.get_logger().info("TCP pong 수신 (프로토콜 OK)")
+                            # 매 핑 주기마다 찍히는 노이즈 — DEBUG로 강등.
+                            # 통합런치 기본(verbose=False)에서는 숨고, gripper_verbose:=true 시에만 노출.
+                            self.get_logger().debug("TCP pong 수신 (프로토콜 OK)")
                         elif mtype == "ack":
                             cmd_id = int(msg.get("id", 0))
                             with self._ack_lock:
@@ -1615,8 +1619,9 @@ class GripperNode(Node):
                         self._tcp_state_seen = True
                         self.get_logger().info("TCP state 수신 시작")
                     self._last_gpos_lo = int(gpos_lo)
-                    # concise dbg
-                    self.get_logger().info(
+                    # 매 프레임 state readback — 평소엔 시끄럽기만 하니 DEBUG로 강등.
+                    # 디버깅 시 `--ros-args --log-level debug` 또는 노드 로거 레벨 DEBUG로 볼 수 있다.
+                    self.get_logger().debug(
                         f"DBG cur(reg{self._present_current_reg})={self._current_hz_cur} "
                         f"gcur(reg{self._goal_cur_reg})={gcur} "
                         f"gpos_lo(reg{self._goal_pos_reg})={gpos_lo} gpos_hi(reg{self._goal_pos_reg}+1)={gpos_hi}"
@@ -1644,7 +1649,8 @@ class GripperNode(Node):
                         srv_pcur = msg.get("pcur_reg", "?")
                         srv_gcur = msg.get("gcur_reg", "?")
                         srv_gpos = msg.get("gpos_reg", "?")
-                        self.get_logger().info(
+                        # 매 프레임 state readback — DEBUG로 강등 (시끄러움 제거).
+                        self.get_logger().debug(
                             f"DBG cur(reg{srv_pcur})={self._current_hz_cur} "
                             f"gcur(reg{srv_gcur})={msg.get('gcur')} "
                             f"gpos_lo(reg{srv_gpos})={msg.get('gpos_lo')} gpos_hi(reg{srv_gpos}+1)={msg.get('gpos_hi')}"

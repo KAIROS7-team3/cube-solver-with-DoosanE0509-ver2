@@ -13,6 +13,7 @@ once via GetCubeState before solving. Any sub-step failure transitions to FAULT.
 """
 from __future__ import annotations
 
+import json
 import threading
 from typing import Optional
 
@@ -45,12 +46,23 @@ from cube_interfaces.action import (
 
 PICKUP_STEPS = ("RELEASE_HOME", "DESCEND", "GRIP", "LIFT")
 PLACE_STEPS = ("APPROACH", "RELEASE")
-ROTATE_SEQUENCE = ("B", "R", "F", "L", "D", "B_AGAIN")
-CAPTURE_FACES = {"B", "R", "F", "L", "D"}
+# 정상 스캔은 5면. B_AGAIN(=Cube_scan_B 재이동)은 인식 실패 시 사용자가
+# /robot/rotate_cube_for_face 액션을 직접 호출해 수동으로 복구하는 경로로만 사용한다.
+ROTATE_SEQUENCE = ("B", "R", "F", "L", "D")
 
-# start_scan / start_solve 서비스 콜백이 블로킹 대기할 최대 시간 (초)
-SCAN_CALLBACK_TIMEOUT_SEC  = 600.0
-SOLVE_CALLBACK_TIMEOUT_SEC = 600.0
+# perception(Gemini)이 반환하는 state_54는 색상 letter(W/R/G/Y/O/B).
+# kociemba는 face letter(U/R/F/D/L/B)를 입력으로 받으므로 solve 호출 직전에 변환한다.
+# 매핑은 그리퍼가 큐브를 잡는 표준 자세(흰 ↑, 노 ↓, 초 정면, 파 후면, 빨 우, 주 좌)를 가정.
+# webui/cube/state_raw 등 외부 노출 필드는 원색을 유지하고, 변환은 _run_solve 내부에서만 1회 적용.
+_COLOR_TO_FACE = str.maketrans({
+    "W": "U", "Y": "D", "G": "F", "B": "B", "R": "R", "O": "L",
+})
+
+# start_scan 서비스 콜백이 블로킹 대기할 최대 시간 (초)
+SCAN_CALLBACK_TIMEOUT_SEC = 600.0
+# start_solve 는 토큰 수·속도에 따라 시간 예측이 어려우므로 무제한 대기.
+# 로봇이 멈춘 경우 /orchestrator/cancel 로 취소 가능.
+SOLVE_CALLBACK_TIMEOUT_SEC = None  # type: ignore[assignment]
 
 
 class MasterOrchestratorNode(Node):
@@ -474,8 +486,6 @@ class MasterOrchestratorNode(Node):
             if self._cancel_event.is_set():
                 self._handle_fault("cancelled")
                 return None
-            if step not in CAPTURE_FACES:
-                continue
             self._transition(f"PERCEIVE_FACE({step})")
             if not self._run_extract(step):
                 self._handle_fault(f"perceive {step} failed")
@@ -498,10 +508,21 @@ class MasterOrchestratorNode(Node):
     # FSM: 분기 2 — solve execute
     # ------------------------------------------------------------------
     def _run_solve_execute(self, tokens: list[str]) -> bool:
-        """PLACE → TOKEN×N → HOME. Returns True on success."""
+        """PLACE → HOME(1회) → TOKEN×N → HOME. Returns True on success."""
         self._transition("PLACE_ON_JIG")
         if not self._run_place():
             self._handle_fault("PlaceOnJig failed")
+            return False
+        if self._cancel_event.is_set():
+            self._handle_fault("cancelled")
+            return False
+
+        # 토큰 루프 시작 전에 단 1회 GoHome — 시작 자세(JOINT_HOME)를 normalize.
+        # robot_action_server 의 토큰 wrap 이 제거되어 매 토큰마다 JOINT_HOME 을
+        # 경유하지 않으므로, 첫 토큰 진입 전에 orchestrator 가 직접 한 번만 부른다.
+        self._transition("GO_HOME")
+        if not self._run_home():
+            self._handle_fault("GoHome (pre-tokens) failed")
             return False
         if self._cancel_event.is_set():
             self._handle_fault("cancelled")
@@ -600,7 +621,9 @@ class MasterOrchestratorNode(Node):
             msg = getattr(res, "message", "no response") if res else "timeout"
             self.get_logger().error(f"ExtractFace({face}) failed: {msg}")
             return False
-        self._publish_string(self._face_colors_pub, f"{face}:captured")
+        # NOTE: ExtractFace는 이미지 캡처 ACK만 — colors_9는 항상 빈 문자열.
+        # 실제 색은 GetCubeState 응답에서만 얻을 수 있으므로 face_colors publish는
+        # _run_solve에서 GetCubeState 호출 직후 한 번에 처리한다 (README 참고).
         self.get_logger().info(f"face {face} captured")
         return True
 
@@ -613,25 +636,33 @@ class MasterOrchestratorNode(Node):
             msg = getattr(res, "message", "no response") if res else "timeout"
             self.get_logger().error(f"GetCubeState failed: {msg}")
             return None, ""
-        urfdlb = res.state_54
-        if len(urfdlb) != 54:
+        state_colors = res.state_54
+        if len(state_colors) != 54:
             self.get_logger().error(
-                f"GetCubeState bad length {len(urfdlb)}: {urfdlb!r}"
+                f"GetCubeState bad length {len(state_colors)}: {state_colors!r}"
             )
             return None, ""
-        self.get_logger().info(f"state_raw: {urfdlb}")
+        self.get_logger().info(f"state_raw: {state_colors}")
+
+        # webui에 6면 색을 표시 — kociemba 호출 전에 사용자가 색을 확인할 수 있도록.
+        # faces_json은 row-major(원본 1..9) 9자/면 — webui 렌더 포맷과 일치.
+        self._publish_face_colors_from_json(getattr(res, "faces_json", ""))
 
         if kociemba is None:
             self.get_logger().error("kociemba module not available")
-            return None, urfdlb
+            return None, state_colors
+        # 색상 letter(W/R/G/Y/O/B) → face letter(U/R/F/D/L/B) 변환 후 kociemba 호출.
+        # 변환된 문자열은 kociemba 입력 전용으로만 쓰고, 캐시/응답에는 원색(state_colors)을 그대로 유지.
+        urfdlb = state_colors.translate(_COLOR_TO_FACE)
+        self.get_logger().info(f"state_urfdlb: {urfdlb}")
         try:
             solution = str(kociemba.solve(urfdlb)).strip()
         except Exception as exc:
             self.get_logger().error(f"kociemba.solve failed: {exc}")
-            return None, urfdlb
+            return None, state_colors
         tokens = [tok for tok in solution.split() if tok]
         self.get_logger().info(f"solution ({len(tokens)} moves): {solution}")
-        return tokens, urfdlb
+        return tokens, state_colors
 
     def _run_token(self, token: str) -> bool:
         goal = ExecuteSolveToken.Goal()
@@ -767,6 +798,27 @@ class MasterOrchestratorNode(Node):
         msg = String()
         msg.data = text
         publisher.publish(msg)
+
+    def _publish_face_colors_from_json(self, faces_json: str) -> None:
+        """GetCubeState.faces_json(row-major 9자/면)을 6면 face_colors 메시지로 발행.
+
+        webui는 face_colors 토픽을 `face:9chars` 포맷으로 받아 면 타일 9칸을
+        WYROBG CSS 클래스로 렌더한다. ExtractFace는 colors_9가 빈 문자열이라
+        스캔 도중에는 색을 알 수 없고, GetCubeState 응답에서만 6면 색이
+        한 번에 확정되므로 여기서 burst publish 한다.
+        """
+        if not faces_json:
+            return
+        try:
+            faces = json.loads(faces_json)
+        except Exception as exc:
+            self.get_logger().warning(f"faces_json parse failed: {exc}")
+            return
+        for face in ("U", "R", "F", "D", "L", "B"):
+            colors = str(faces.get(face, ""))
+            if len(colors) != 9:
+                continue
+            self._publish_string(self._face_colors_pub, f"{face}:{colors}")
 
     def _handle_fault(self, reason: str) -> None:
         self.get_logger().error(f"FAULT: {reason}")

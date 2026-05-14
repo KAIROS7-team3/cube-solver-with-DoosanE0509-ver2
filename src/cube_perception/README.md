@@ -33,6 +33,10 @@
   - `/camera/camera/color/image_raw`
   - `/camera/camera/aligned_depth_to_color/image_raw`
   - `/camera/camera/color/camera_info`
+- 핸드아이 캘리브레이션
+  - [`config/calibration.yaml`](config/calibration.yaml)에 4×4 row-major `T_base_cam` 저장 (`vla_detection_node`가 파라미터로 로드).
+  - `full_stack.launch.py`가 자동으로 이 yaml을 노드에 주입한다.
+  - 캘리브레이션 갱신 시 yaml만 수정하면 되며 코드 재빌드는 불필요(`--symlink-install`).
 - `.env` 설정
 
 ```bash
@@ -91,21 +95,21 @@ ros2 launch cube_perception perception_stack.launch.py \
 3. 상태 조회 (`GetCubeState`) 1회
    - 여기서 Gemini 2차 추정 실행 후 U 캐시와 결합한 `state_54` 수신
 
-CLI 예시:
+CLI 예시 (`full_stack.launch.py` 또는 `perception_stack.launch.py`로 띄운 후):
 
 ```bash
-# 1차 API
-ros2 service call /detect_cube_pose cube_interfaces/srv/DetectCubePose "{hint: ''}"
+# 1차 API — 큐브 위치 + U면 캐싱
+ros2 service call /cube_perception/detect_cube_pose cube_interfaces/srv/DetectCubePose "{hint: ''}"
 
 # 2차 API (면 캡처 ACK: B/R/F/L/D)
-ros2 service call /color_extraction_node/extract_face cube_interfaces/srv/ExtractFace "{face: 'B'}"
-ros2 service call /color_extraction_node/extract_face cube_interfaces/srv/ExtractFace "{face: 'R'}"
-ros2 service call /color_extraction_node/extract_face cube_interfaces/srv/ExtractFace "{face: 'F'}"
-ros2 service call /color_extraction_node/extract_face cube_interfaces/srv/ExtractFace "{face: 'L'}"
-ros2 service call /color_extraction_node/extract_face cube_interfaces/srv/ExtractFace "{face: 'D'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'B'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'R'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'F'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'L'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'D'}"
 
-# 3차 API (최종 상태 조회)
-ros2 service call /color_extraction_node/get_cube_state cube_interfaces/srv/GetCubeState "{}"
+# 3차 API — 5면 분류 + U 캐시 결합 → state_54 + faces_json
+ros2 service call /cube_perception/get_cube_state cube_interfaces/srv/GetCubeState "{}"
 ```
 
 ## 디버그/테스트 도구

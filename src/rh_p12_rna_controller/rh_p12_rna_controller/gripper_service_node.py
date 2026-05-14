@@ -18,6 +18,14 @@ class GripperServiceNode(GripperNode):
     def __init__(self):
         super().__init__()
 
+        # 로그 verbosity 제어용 파라미터.
+        #   verbose=False (기본) → INFO/WARN/ERROR 그대로 출력. 시끄러운 매 프레임 state
+        #                          readback("DBG cur=…")만 DEBUG로 강등되어 숨김.
+        #                          → 시작/접속/명령 로그는 보이고 폴링 노이즈만 제거된 상태.
+        #   verbose=True         → 노드 로거를 DEBUG로 올려 readback까지 전부 노출 (디버깅용).
+        # 통합런치 `gripper_verbose:=true` 또는 단독실행 `--ros-args -p verbose:=true`로 활성화.
+        self.declare_parameter("verbose", False)
+
         # Services
         self._srv_get_state = self.create_service(GetState, "/gripper/get_state", self._on_get_state)
         self._srv_set_position = self.create_service(
@@ -218,6 +226,14 @@ class GripperServiceNode(GripperNode):
 def main(args=None):
     rclpy.init(args=args)
     node = GripperServiceNode()
+    # verbose=True면 노드 로거를 DEBUG로 올려 매 프레임 state readback("DBG cur=…")까지 표시.
+    # 기본(False)에서는 그 readback이 DEBUG로 강등되어 안 보이고, 그 외 INFO/WARN은 정상 출력 —
+    # 그래서 노드 시작/접속/명령 로그는 그대로 보이고 시끄러운 폴링만 사라진다.
+    if bool(node.get_parameter("verbose").value):
+        rclpy.logging.set_logger_level(
+            node.get_logger().name,
+            rclpy.logging.LoggingSeverity.DEBUG,
+        )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

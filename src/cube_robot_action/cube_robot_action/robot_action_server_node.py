@@ -36,7 +36,7 @@ from cube_interfaces.action import SafeGrasp
 from .motion_library import (
     Step, StepKind,
     PULSE_OPEN, PULSE_CUBE,
-    TCP_NAME,
+    TCP_NAME, TCP_POS,
     JOINT_HOME, ZIG_HOME,
     token_sequence, VALID_TOKENS,
     pickup_step_seq, PICKUP_STEPS,
@@ -116,14 +116,32 @@ class RobotActionServerNode(Node):
             self.get_logger().info('✅ /gripper/safe_grasp 연결됨')
 
     def _init_tcp_sync(self):
+        """TCP 등록/활성화. drl_start 안 씀 → 그리퍼의 장기 DRL TCP 서버를 죽이지 않음.
+
+        ConfigCreateTcp(name, pos) → 컨트롤러 TCP 프로파일 등록(덮어쓰기)
+        SetCurrentTcp(name)        → 현재 활성 TCP로 지정
+        GetCurrentTcp()            → 활성 이름 확인용(로깅)
+        """
         self._tcp_timer.cancel()
         try:
-            if self.drl_cli.service_is_ready():
-                req = DrlStart.Request()
-                req.robot_system = 0
-                req.code = f'set_tcp("{TCP_NAME}")'
-                self.drl_cli.call_async(req)
-                self.get_logger().info(f'✅ TCP 설정: {TCP_NAME}')
+            if self.cfg_tcp_cli.service_is_ready():
+                req = ConfigCreateTcp.Request()
+                req.name = TCP_NAME
+                req.pos = [float(v) for v in TCP_POS]
+                self.cfg_tcp_cli.call_async(req)
+                self.get_logger().info(
+                    f'✅ TCP 등록 요청: {TCP_NAME} pos={TCP_POS}'
+                )
+            else:
+                self.get_logger().warn('⚠️ config_create_tcp 서비스 미준비')
+
+            if self.set_tcp_cli.service_is_ready():
+                req2 = SetCurrentTcp.Request()
+                req2.name = TCP_NAME
+                self.set_tcp_cli.call_async(req2)
+                self.get_logger().info(f'✅ TCP 활성화 요청: {TCP_NAME}')
+            else:
+                self.get_logger().warn('⚠️ set_current_tcp 서비스 미준비')
         except Exception as e:
             self.get_logger().warn(f'⚠️ TCP 예외: {e}')
         self._tcp_ready = True
@@ -189,7 +207,10 @@ class RobotActionServerNode(Node):
             return result
 
         self._feedback(gh, 'approach', 0.0)
-        steps = [JOINT_HOME()] + token_sequence(token) + [JOINT_HOME()]
+        # JOINT_HOME wrap 제거 — 토큰 시퀀스 자체가 ZIG_HOME 으로 시작/종료하므로
+        # 매 토큰마다 JOINT_HOME 경유는 불필요한 누적 시간(토큰당 ~3~4s)을 만든다.
+        # 풀이 시작 직전에 orchestrator 가 GoHome 을 1회만 호출해 시작 자세를 normalize 함.
+        steps = token_sequence(token)
         ok = await self._run_sequence(gh, steps)
 
         if ok is None:
@@ -287,7 +308,9 @@ class RobotActionServerNode(Node):
         self.get_logger().info('▶ GoHome')
         result = GoHome.Result()
         self._feedback(gh, 'moving', 0.0)
-        ok = await self._run_sequence(gh, [JOINT_HOME(), ZIG_HOME(), JOINT_HOME()])
+        # JOINT_HOME 한 step 만 — 이전 [JOINT_HOME, ZIG_HOME, JOINT_HOME] 3 step은
+        # 중복(MOVE_L 로 ZIG 갔다가 다시 JOINT_HOME 으로 돌아옴)이라 시간만 늘림.
+        ok = await self._run_sequence(gh, [JOINT_HOME()])
         if ok is None:
             result.success, result.message = False, 'GoHome 취소됨'
         elif not ok:

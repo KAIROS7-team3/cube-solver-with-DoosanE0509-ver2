@@ -28,3 +28,6 @@ htmlcov/
 
 # 벤더: 공식 리포를 src에서 직접 clone (이 저장소에는 포함하지 않음)
 src/doosan-robot2/
+
+# Claude Code 워크트리/세션 캐시 (로컬 전용)
+.claude/

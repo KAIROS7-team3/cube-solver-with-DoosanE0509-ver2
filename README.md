@@ -4,7 +4,7 @@
 
 작업공간 임의 위치에 놓인 큐브를 카메라로 감지 → 픽업 → 6면 색상 인식 → kociemba 솔빙 → 모션 실행까지 end-to-end로 수행하는 ROS2 시스템입니다. 기존 단일 패키지 구조(`cube-solver-with-DoosanE0509-ver1`)를 6개 패키지로 재구성했습니다.
 
-> ℹ️ **현재 상태**: 핵심 패키지 구현 완료. 실기 통합 검증 진행 전 단계.
+> ℹ️ **현재 상태**: 실기 통합 사이클 1회 성공 (스캔 → 솔빙 → 토큰 실행 → 복귀). 안정화/튜닝 진행 중.
 
 ---
 
@@ -210,7 +210,7 @@ src/
 | `DetectCubePose` | cube_perception | `string hint` → `PoseStamped pose, float32 confidence, bool success, string message` |
 | `ExtractFace` | cube_perception | `string face` → `string colors_9, bool success, string message` |
 | `GetCubeState` | cube_perception | (없음) → `string state_54, bool success, string message` |
-| `StartRun` | cube_orchestrator | (없음) → `bool success, string message` (`skip_pickup` 옵션은 제거됨) |
+| `StartRun` | cube_orchestrator | (없음) → `bool success, string message, string state_54, string solution` |
 | `StartScan` | cube_orchestrator | (없음) → `bool success, string message, string state_54, string solution` |
 | `StartSolve` | cube_orchestrator | `string solution` → `bool success, string message` |
 
@@ -234,6 +234,11 @@ src/
 |---|---|---|---|
 | `/orchestrator/state` | std_msgs/String | cube_orchestrator | FSM 상태 문자열 |
 | `/orchestrator/solution` | std_msgs/String | cube_orchestrator | 솔빙 결과 토큰 문자열 |
+| `/orchestrator/current_token` | std_msgs/String | cube_orchestrator | 실행 중 토큰 |
+| `/orchestrator/face_colors` | std_msgs/String | cube_orchestrator | `face:9chars` 포맷, GetCubeState 직후 6면 burst publish (webui 색 셀 렌더용) |
+| `/orchestrator/last_detection` | geometry_msgs/PoseStamped | cube_orchestrator | DetectCubePose 결과 |
+| `/orchestrator/fault` | std_msgs/String | cube_orchestrator | 실패 사유 |
+| `/cube_perception/u_face_cache` | std_msgs/String | vla_detection_node | DetectCubePose가 캐싱한 U면 9자 |
 | `/cube/state_raw` | std_msgs/String | color_extraction_node | 6면 54자 큐브 상태 (디버그) |
 | `~/debug/image` | sensor_msgs/Image | vla_detection_node | 어노테이션된 RGB (디버그) |
 
@@ -249,13 +254,15 @@ src/
 IDLE
  │ (StartScan 수신)
  ▼
-DETECT_CUBE → PICKUP(×4 step) → ROTATE_FOR_FACE(B/R/F/L/D/B_AGAIN)
-                                      │ 각 면 후 ExtractFace
+DETECT_CUBE → PICKUP(×4 step) → ROTATE_FOR_FACE(B/R/F/L/D)
+                                      │ 각 면 회전 직후 ExtractFace×5
                                       ▼
-                                  SOLVE (kociemba, GetCubeState 1회)
+                                  SOLVE (kociemba, GetCubeState 1회 + face_colors publish)
                                       │
                                       ▼
                                    DONE → 결과 반환 (state_54 + solution)
+
+※ B_AGAIN은 자동 시퀀스에서 제거되었고, 수동 복구 경로(webui/CLI에서 단독 호출)로만 남아 있습니다.
 ```
 
 ### Solve 분기 (`StartSolve`)
@@ -276,10 +283,12 @@ PLACE_ON_JIG(×2 step) → EXECUTE_TOKEN_i(loop) → GO_HOME → DONE
 ## 모션 전략
 
 - **`motion_library.py`** — 18개 솔빙 토큰(U/U'/U2, R/..., F/..., L/..., B/..., D/...) + `'P'`(정지) 별 `Step` 시퀀스 정의. ROS2 의존성 없는 순수 Python 라이브러리.
-- **`Step` 타입** — `MOVE_L_ABS` | `MOVE_L_REL` | `MOVE_J_REL` | `GRIP` | `WAIT` 5종.
+- **`Step` 타입** — `MOVE_L_ABS` | `MOVE_L_REL` | `MOVE_J_ABS` | `MOVE_J_REL` | `GRIP` | `WAIT` 6종.
 - **웨이포인트 상수** — `INITIAL_STATE`, `JOINT_HOME_POS`, `L_DROP_POS`, `R_DROP_POS`, `CUBE_SCAN_B/D` 등을 기존 DRL에서 포팅.
 - **실행** — `_run_sequence()`가 각 Step을 `await`로 직렬 호출. GRIP step은 `/gripper/safe_grasp` (`SafeGrasp` 액션)을 실제 호출.
 - **그리퍼 동기화** — `await send_goal_async` + `await get_result_async` 두 단계로 goal 수락 확인 → 결과 수신까지 동기 대기. OPEN: position-only 판정 (`current_threshold=9999`), CLOSE: 전류 기반 grasped 판정 (`current_threshold=300`).
+- **GoHome / 토큰 wrap 정책** — `ExecuteSolveToken` 콜백은 토큰 시퀀스만 실행 (이전 `[JOINT_HOME, ..., JOINT_HOME]` wrap 제거). 시작 자세 normalize 는 orchestrator가 솔빙 시작 직전 1회만 `GoHome` 호출. `GoHome` 자체도 단일 `JOINT_HOME` step (기존 3-step 중복 제거).
+- **속도 기본값** — `VEL_X = VEL_R = VEL_J = 35`, `ACC_X = ACC_R = ACC_J = 25` (`motion_library.py` 상단). DRL 원본(`VEL_X=250` 등)에 대비한 안전 마진.
 
 ---
 
@@ -342,6 +351,8 @@ PULSE_REPOSE = 420   # 재파지
 
 ## 빌드 & 실행
 
+### 일반 운용 (full stack + webui)
+
 ```bash
 # 0. ROS2 Humble 소스
 source /opt/ros/humble/setup.bash
@@ -349,9 +360,9 @@ source /opt/ros/humble/setup.bash
 # 1. pip 의존성 (rosdep으로 안 깔리는 패키지 — 자세한 설명은 위 "개발 환경" 섹션 참고)
 pip install kociemba google-genai python-dotenv fastapi "uvicorn[standard]" opencv-python numpy
 
-# 2. 빌드 (인터페이스 패키지 우선)
-colcon build --packages-select cube_interfaces
-colcon build --packages-select \
+# 2. 빌드 (--symlink-install 권장: launch/yaml/python 수정 시 재빌드 없이 반영됨)
+colcon build --symlink-install --packages-select cube_interfaces
+colcon build --symlink-install --packages-select \
     cube_perception cube_robot_action cube_orchestrator \
     rh_p12_rna_controller cube_webui
 source install/setup.bash
@@ -360,6 +371,18 @@ source install/setup.bash
 ros2 launch cube_orchestrator full_stack.launch.py \
     dsr_host:=110.120.1.40 dsr_port:=12345
 
+# 4. Web UI 기동 (별도 터미널)
+ros2 launch cube_webui webui.launch.py   # http://localhost:8080
+```
+
+브라우저에서 `http://localhost:8080`에 접속하면 Start Scan / Start Solve / Start Run / Cancel
+버튼으로 전체 시나리오를 트리거할 수 있습니다. 일반 운용은 여기까지면 충분합니다.
+
+### 테스트용 CLI (선택)
+
+webui 없이 CLI로 직접 호출하고 싶을 때만 사용하세요. webui로도 동일 기능을 모두 실행할 수 있습니다.
+
+```bash
 # 4a. Scan (감지 + 색상 인식 + 솔빙)
 ros2 service call /cube_orchestrator/start_scan cube_interfaces/srv/StartScan "{}"
 
@@ -369,9 +392,12 @@ ros2 service call /cube_orchestrator/start_solve cube_interfaces/srv/StartSolve 
 # 4c. Run (scan + solve 연속)
 ros2 service call /cube_orchestrator/start_run cube_interfaces/srv/StartRun "{}"
 
-# 5. Web UI
-ros2 launch cube_webui webui.launch.py   # http://localhost:8080
+# 4d. 취소 / 비상정지
+ros2 service call /orchestrator/cancel std_srvs/srv/Trigger "{}"
+ros2 service call /orchestrator/emergency_stop std_srvs/srv/Trigger "{}"
 ```
+
+> 노드/액션/서비스 단위 테스트 명령어는 [docs/TEST_COMMANDS.md](docs/TEST_COMMANDS.md) 참고.
 
 ---
 
