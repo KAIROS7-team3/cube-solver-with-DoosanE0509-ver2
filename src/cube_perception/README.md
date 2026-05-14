@@ -33,6 +33,10 @@
   - `/camera/camera/color/image_raw`
   - `/camera/camera/aligned_depth_to_color/image_raw`
   - `/camera/camera/color/camera_info`
+- 핸드아이 캘리브레이션
+  - [`config/calibration.yaml`](config/calibration.yaml)에 4×4 row-major `T_base_cam` 저장 (`vla_detection_node`가 파라미터로 로드).
+  - `full_stack.launch.py`가 자동으로 이 yaml을 노드에 주입한다.
+  - 캘리브레이션 갱신 시 yaml만 수정하면 되며 코드 재빌드는 불필요(`--symlink-install`).
 - `.env` 설정
 
 ```bash
@@ -40,11 +44,27 @@ GEMINI_API_KEY=YOUR_API_KEY
 GEMINI_MODEL=gemini-robotics-er-1.6-preview
 ```
 
+> **⚠️ `.env` 위치 주의**
+>
+> `gemini_vla_backend.py`는 `python-dotenv`의 `load_dotenv()`를 인자 없이 호출합니다.
+> `load_dotenv()`는 **현재 작업 디렉토리(cwd) 및 그 상위 경로**에서 `.env`를 찾습니다.
+> 따라서 다음 두 조건 중 하나가 충족되어야 합니다.
+>
+> 1. **워크스페이스 루트(`cube-solver-with-DoosanE0509-ver2/`)에 `.env`를 두고**, `ros2 run` / `ros2 launch`를 워크스페이스 루트(또는 그 하위 디렉토리)에서 실행한다.
+> 2. 또는 노드 실행 전에 환경변수를 직접 export 한다.
+>    ```bash
+>    export GEMINI_API_KEY=...
+>    export GEMINI_MODEL=gemini-robotics-er-1.6-preview
+>    ```
+>
+> 즉 **`.env` 파일이 있어도 cwd가 엉뚱한 곳이면 로드되지 않으므로**, `cd ~/cube-solver-with-DoosanE0509-ver2&& ros2 launch ...` 형태로 실행 위치를 맞춰주세요. 미설정 시 `RuntimeError: GEMINI_API_KEY is not set` 으로 실패합니다.
+
 ## 빌드
 
 ```bash
 cd ~/cube_solver_ver2_ws
 source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select cube_interfaces
 colcon build --symlink-install --packages-select cube_perception
 source install/setup.bash
 ```
@@ -75,21 +95,21 @@ ros2 launch cube_perception perception_stack.launch.py \
 3. 상태 조회 (`GetCubeState`) 1회
    - 여기서 Gemini 2차 추정 실행 후 U 캐시와 결합한 `state_54` 수신
 
-CLI 예시:
+CLI 예시 (`full_stack.launch.py` 또는 `perception_stack.launch.py`로 띄운 후):
 
 ```bash
-# 1차 API
-ros2 service call /detect_cube_pose cube_perception/srv/DetectCubePose "{hint: ''}"
+# 1차 API — 큐브 위치 + U면 캐싱
+ros2 service call /cube_perception/detect_cube_pose cube_interfaces/srv/DetectCubePose "{hint: ''}"
 
 # 2차 API (면 캡처 ACK: B/R/F/L/D)
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'B'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'R'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'F'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'L'}"
-ros2 service call /color_extraction_node/extract_face cube_perception/srv/ExtractFace "{face: 'D'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'B'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'R'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'F'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'L'}"
+ros2 service call /cube_perception/extract_face cube_interfaces/srv/ExtractFace "{face_label: 'D'}"
 
-# 3차 API (최종 상태 조회)
-ros2 service call /color_extraction_node/get_cube_state cube_perception/srv/GetCubeState "{}"
+# 3차 API — 5면 분류 + U 캐시 결합 → state_54 + faces_json
+ros2 service call /cube_perception/get_cube_state cube_interfaces/srv/GetCubeState "{}"
 ```
 
 ## 디버그/테스트 도구

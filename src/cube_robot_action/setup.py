@@ -12,8 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'action'),
-            glob('action/*.action')),
+        # action 정의는 cube_interfaces로 이전됨 — 이 패키지는 ament_python(런타임 노드)만 담당.
     ],
     install_requires=['setuptools'],
     zip_safe=True,

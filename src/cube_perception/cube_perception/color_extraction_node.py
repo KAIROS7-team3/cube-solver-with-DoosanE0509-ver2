@@ -25,8 +25,8 @@ from std_msgs.msg import String
 from .detection.gemini_vla_backend import GeminiVLADetector
 
 try:
-    from cube_perception.srv import ExtractFace
-    from cube_perception.srv import GetCubeState
+    from cube_interfaces.srv import ExtractFace
+    from cube_interfaces.srv import GetCubeState
 except ImportError:
     ExtractFace = None
     GetCubeState = None

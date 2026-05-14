@@ -7,9 +7,9 @@ import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from rh_p12_rna_controller.gripper_node import GripperNode, ModbusRTU
-from rh_p12_rna_controller_interfaces.action import SafeGrasp
-from rh_p12_rna_controller_interfaces.srv import GetState, SetPosition
-from rh_p12_rna_controller_interfaces.msg import GripperState
+from cube_interfaces.action import SafeGrasp
+from cube_interfaces.srv import GetState, SetPosition
+from cube_interfaces.msg import GripperState
 
 
 class GripperServiceNode(GripperNode):
@@ -17,6 +17,14 @@ class GripperServiceNode(GripperNode):
 
     def __init__(self):
         super().__init__()
+
+        # 로그 verbosity 제어용 파라미터.
+        #   verbose=False (기본) → INFO/WARN/ERROR 그대로 출력. 시끄러운 매 프레임 state
+        #                          readback("DBG cur=…")만 DEBUG로 강등되어 숨김.
+        #                          → 시작/접속/명령 로그는 보이고 폴링 노이즈만 제거된 상태.
+        #   verbose=True         → 노드 로거를 DEBUG로 올려 readback까지 전부 노출 (디버깅용).
+        # 통합런치 `gripper_verbose:=true` 또는 단독실행 `--ros-args -p verbose:=true`로 활성화.
+        self.declare_parameter("verbose", False)
 
         # Services
         self._srv_get_state = self.create_service(GetState, "/gripper/get_state", self._on_get_state)
@@ -67,10 +75,15 @@ class GripperServiceNode(GripperNode):
 
             if self._cmd_transport == "drl":
                 # Reuse DRL move+poll helper for robust completion.
-                code = self._build_drl_move_and_poll_for_service(pos, cur)
-                ok = self._call_drl(code, timeout_sec=max(5.0, timeout + 3.0))
-                response.success = bool(ok)
-                response.message = "ok(drl)" if ok else "drl failed"
+                code = self._build_drl_move_and_poll_for_service(pos, cur, user_timeout=timeout)
+                ok = self._call_drl(code, timeout_sec=timeout + 5.0)
+                # DRL ok가 false여도 실측 위치가 도달이면 success.
+                position_reached = abs(int(self._current_hz_pos) - pos) <= int(self._done_tol)
+                response.success = bool(ok or position_reached)
+                if response.success:
+                    response.message = "ok(drl)" if ok else "position_reached(drl_warn)"
+                else:
+                    response.message = "drl failed and position not reached"
             else:
                 if not self._socket_active:
                     response.success = False
@@ -104,10 +117,17 @@ class GripperServiceNode(GripperNode):
             response.final_current = int(self._current_hz_cur)
             return response
 
-    def _build_drl_move_and_poll_for_service(self, pos: int, cur: int) -> str:
+    def _build_drl_move_and_poll_for_service(self, pos: int, cur: int, user_timeout: float = 8.0) -> str:
         # Import from base module-level helper through instance globals.
         # We just call the existing function defined in gripper_node.py namespace.
         from rh_p12_rna_controller.gripper_node import build_drl_move_and_poll  # local import
+
+        # Each DRL polling iteration takes ~0.85s (read_cur + read_pos + wait(0.15)).
+        # Size max_loops to roughly match user timeout, with a small safety margin,
+        # and clamp to a sane range so a tiny timeout does not yield zero loops.
+        per_loop_sec = 0.85
+        loops = int(max(1.0, float(user_timeout)) / per_loop_sec) + 4
+        loops = max(8, min(80, loops))
 
         return build_drl_move_and_poll(
             slave_id=self._slave_id,
@@ -115,7 +135,7 @@ class GripperServiceNode(GripperNode):
             target_current=int(cur),
             grip_current_threshold=int(self._grip_threshold),
             pos_tolerance=int(self._done_tol),
-            max_loops=80,
+            max_loops=loops,
         )
 
     def _execute_safe_grasp(self, goal_handle):
@@ -148,10 +168,13 @@ class GripperServiceNode(GripperNode):
                         ok = False
                         msg = f"pos ack failed: {err2}"
             else:
-                # drl mode: use DRL move+poll to completion
-                code = self._build_drl_move_and_poll_for_service(target, gcur)
-                ok = bool(self._call_drl(code, timeout_sec=max(5.0, timeout + 3.0)))
-                msg = "ok(drl)" if ok else "drl failed"
+                # drl mode: use DRL move+poll to completion.
+                # _call_drl 대기 시간을 user timeout 기반으로 제한 — 그리퍼가 1~2s에 끝나는데
+                # 60s 천장이 잡혀 있으면 DRL polling이 이상하게 늘어졌을 때 액션 응답이 끔찍하게 늦음.
+                # 어차피 success는 실측 위치(position_reached) 기반으로 판정하므로 DRL이 일찍 끊겨도 무방.
+                code = self._build_drl_move_and_poll_for_service(target, gcur, user_timeout=timeout)
+                ok = bool(self._call_drl(code, timeout_sec=timeout + 5.0))
+                msg = "ok(drl)" if ok else "drl failed/slow"
 
             start = time.time()
             grasped = False
@@ -171,12 +194,25 @@ class GripperServiceNode(GripperNode):
                     break
                 time.sleep(0.05)
 
+            # 권위 기준: 실제 위치/전류. DRL 호출(ok)은 부가 정보로만 사용.
+            # → 그리퍼가 물리적으로 목표 위치에 도달했거나 grasped(전류 임계 초과)면 success.
+            #   DRL 폴링이 readback 일시 실패로 false를 반환해도, 실측 위치가 도달이면 성공 처리.
+            position_reached = abs(int(self._current_hz_pos) - target) <= int(self._done_tol)
             result = SafeGrasp.Result()
-            result.success = bool(ok and (grasped or abs(int(self._current_hz_pos) - target) <= int(self._done_tol)))
+            result.success = bool(grasped or position_reached)
             result.grasped = bool(grasped)
             result.final_position = int(self._current_hz_pos)
             result.final_current = int(self._current_hz_cur)
-            result.message = msg if msg else ("grasped" if grasped else "done")
+            if result.success:
+                if grasped:
+                    result.message = "grasped"
+                elif not ok:
+                    # DRL은 실패라고 했지만 위치는 도달 — readback 오류 등 무시
+                    result.message = f"position_reached (drl_warn: {msg})"
+                else:
+                    result.message = "position_reached"
+            else:
+                result.message = msg if msg else "neither grasped nor position_reached"
 
             if result.success:
                 goal_handle.succeed()
@@ -190,6 +226,14 @@ class GripperServiceNode(GripperNode):
 def main(args=None):
     rclpy.init(args=args)
     node = GripperServiceNode()
+    # verbose=True면 노드 로거를 DEBUG로 올려 매 프레임 state readback("DBG cur=…")까지 표시.
+    # 기본(False)에서는 그 readback이 DEBUG로 강등되어 안 보이고, 그 외 INFO/WARN은 정상 출력 —
+    # 그래서 노드 시작/접속/명령 로그는 그대로 보이고 시끄러운 폴링만 사라진다.
+    if bool(node.get_parameter("verbose").value):
+        rclpy.logging.set_logger_level(
+            node.get_logger().name,
+            rclpy.logging.LoggingSeverity.DEBUG,
+        )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

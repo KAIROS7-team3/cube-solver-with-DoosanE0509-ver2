@@ -1,0 +1,27 @@
+# Camera→base extrinsic calibration for vla_detection_node.
+# T_base_cam is a 4x4 row-major matrix that converts a point expressed in the
+# camera optical frame to the robot base frame:
+#   p_base = T_base_cam @ p_cam
+#
+# Update this file whenever the RealSense mount or robot base changes.
+# Source: hand-eye calibration result (team-supplied).
+
+vla_detection_node:
+  ros__parameters:
+    T_base_cam:
+      -  0.999696657
+      - -0.012779230
+      -  0.021054358
+      -  0.677308324
+      - -0.012460264
+      - -0.999806653
+      - -0.015211798
+      - -0.070872069
+      -  0.021244682
+      -  0.014944841
+      - -0.999662601
+      -  0.677966604
+      -  0.000000000
+      -  0.000000000
+      -  0.000000000
+      -  1.000000000

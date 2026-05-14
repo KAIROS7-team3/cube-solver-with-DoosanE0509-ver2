@@ -23,7 +23,7 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.qos import qos_profile_sensor_data
 
-from rh_p12_rna_controller.action import GripperCommand
+from cube_interfaces.action import GripperCommand
 from dsr_msgs2.srv import DrlStart
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
@@ -149,14 +149,21 @@ def build_drl_move_and_poll(
         "\n"
         "__done = False\n"
         f"__loop = {max_loops}\n"
+        "__rb_fail = 0\n"
         "while not __done and __loop > 0:\n"
         "    __loop = __loop - 1\n"
         "    __cur = _read_cur()\n"
+        "    __pos = _read_pos()\n"
+        "    if __cur == -99999 and __pos == -99999:\n"
+        "        __rb_fail = __rb_fail + 1\n"
+        "        if __rb_fail >= 5:\n"
+        "            break\n"
+        "    else:\n"
+        "        __rb_fail = 0\n"
         "    if __cur != -99999:\n"
         f"        if abs(__cur) > {int(grip_current_threshold)}:\n"
         "            __done = True\n"
         "            break\n"
-        "    __pos = _read_pos()\n"
         "    if __pos != -99999:\n"
         f"        if __pos >= {int(target_pulse - pos_tolerance)} and __pos <= {int(target_pulse + pos_tolerance)}:\n"
         "            __done = True\n"
@@ -1390,7 +1397,7 @@ class GripperNode(Node):
             return
 
         waited = 0.0
-        while not self._cli_drl.service_is_ready() and waited < 5.0:
+        while not self._cli_drl.service_is_ready() and waited < 30.0:
             time.sleep(0.5)
             waited += 0.5
 
@@ -1419,7 +1426,7 @@ class GripperNode(Node):
                     ModbusRTU.fc06(self._slave_id, 256, 1),  # TORQUE_ENABLE
                     ModbusRTU.fc06(self._slave_id, 275, self._cur_init),  # GOAL_CURRENT
                 ]
-                if not self._call_drl(build_drl_write_packets(init_pkts), timeout_sec=5.0):
+                if not self._call_drl(build_drl_write_packets(init_pkts), timeout_sec=15.0):
                     self.get_logger().error("DRL 직접 초기화 실패(토크ON/기본전류)")
                 else:
                     self.get_logger().info("DRL 직접 초기화 완료(토크ON/기본전류)")
@@ -1524,7 +1531,9 @@ class GripperNode(Node):
                             self._tcp_pong_seen = True
                             self._tcp_hello_seen = True
                             self._last_pong_rx_t = time.time()
-                            self.get_logger().info("TCP pong 수신 (프로토콜 OK)")
+                            # 매 핑 주기마다 찍히는 노이즈 — DEBUG로 강등.
+                            # 통합런치 기본(verbose=False)에서는 숨고, gripper_verbose:=true 시에만 노출.
+                            self.get_logger().debug("TCP pong 수신 (프로토콜 OK)")
                         elif mtype == TCP_T_ACK:
                             ok = bool(payload[0]) if len(payload) >= 1 else False
                             err = ""
@@ -1575,7 +1584,9 @@ class GripperNode(Node):
                             self._tcp_pong_seen = True
                             self._tcp_hello_seen = True
                             self._last_pong_rx_t = time.time()
-                            self.get_logger().info("TCP pong 수신 (프로토콜 OK)")
+                            # 매 핑 주기마다 찍히는 노이즈 — DEBUG로 강등.
+                            # 통합런치 기본(verbose=False)에서는 숨고, gripper_verbose:=true 시에만 노출.
+                            self.get_logger().debug("TCP pong 수신 (프로토콜 OK)")
                         elif mtype == "ack":
                             cmd_id = int(msg.get("id", 0))
                             with self._ack_lock:
@@ -1608,8 +1619,9 @@ class GripperNode(Node):
                         self._tcp_state_seen = True
                         self.get_logger().info("TCP state 수신 시작")
                     self._last_gpos_lo = int(gpos_lo)
-                    # concise dbg
-                    self.get_logger().info(
+                    # 매 프레임 state readback — 평소엔 시끄럽기만 하니 DEBUG로 강등.
+                    # 디버깅 시 `--ros-args --log-level debug` 또는 노드 로거 레벨 DEBUG로 볼 수 있다.
+                    self.get_logger().debug(
                         f"DBG cur(reg{self._present_current_reg})={self._current_hz_cur} "
                         f"gcur(reg{self._goal_cur_reg})={gcur} "
                         f"gpos_lo(reg{self._goal_pos_reg})={gpos_lo} gpos_hi(reg{self._goal_pos_reg}+1)={gpos_hi}"
@@ -1637,7 +1649,8 @@ class GripperNode(Node):
                         srv_pcur = msg.get("pcur_reg", "?")
                         srv_gcur = msg.get("gcur_reg", "?")
                         srv_gpos = msg.get("gpos_reg", "?")
-                        self.get_logger().info(
+                        # 매 프레임 state readback — DEBUG로 강등 (시끄러움 제거).
+                        self.get_logger().debug(
                             f"DBG cur(reg{srv_pcur})={self._current_hz_cur} "
                             f"gcur(reg{srv_gcur})={msg.get('gcur')} "
                             f"gpos_lo(reg{srv_gpos})={msg.get('gpos_lo')} gpos_hi(reg{srv_gpos}+1)={msg.get('gpos_hi')}"

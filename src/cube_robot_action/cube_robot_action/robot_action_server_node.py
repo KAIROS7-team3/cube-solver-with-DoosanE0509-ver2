@@ -18,12 +18,12 @@ robot_action_server_node.py
 import time
 
 import rclpy
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from cube_robot_action.action import (
+from cube_interfaces.action import (
     ExecuteSolveToken, PickupCube, PlaceOnJig, GoHome, RotateCubeForFace,
 )
 from dsr_msgs2.srv import (
@@ -31,11 +31,12 @@ from dsr_msgs2.srv import (
     ConfigCreateTcp, SetCurrentTcp, GetCurrentTcp,
 )
 from dsr_msgs2.srv import DrlStart
+from cube_interfaces.action import SafeGrasp
 
 from .motion_library import (
     Step, StepKind,
     PULSE_OPEN, PULSE_CUBE,
-    TCP_NAME,
+    TCP_NAME, TCP_POS,
     JOINT_HOME, ZIG_HOME,
     token_sequence, VALID_TOKENS,
     pickup_step_seq, PICKUP_STEPS,
@@ -48,6 +49,11 @@ Z_SAFE_LIMIT: float = 10.0
 DR_BASE       = 0
 DR_MV_MOD_ABS = 0
 DR_MV_MOD_REL = 1
+
+GRIP_GOAL_CURRENT: int     = 500
+GRIP_THRESHOLD_CLOSE: int  = 300
+GRIP_THRESHOLD_OPEN: int   = 9999
+GRIP_TIMEOUT_SEC: float    = 8.0
 
 
 class RobotActionServerNode(Node):
@@ -71,20 +77,22 @@ class RobotActionServerNode(Node):
         self.cfg_tcp_cli = self.create_client(ConfigCreateTcp, f'{_p}/tcp/config_create_tcp', callback_group=self.cb_group)
         self.set_tcp_cli = self.create_client(SetCurrentTcp,   f'{_p}/tcp/set_current_tcp',   callback_group=self.cb_group)
         self.get_tcp_cli = self.create_client(GetCurrentTcp,   f'{_p}/tcp/get_current_tcp',   callback_group=self.cb_group)
-        self.drl_cli     = self.create_client(DrlStart,  '/drl/drl_start',                callback_group=self.cb_group)
+        self.drl_cli     = self.create_client(DrlStart,  f'{_p}/drl/drl_start',           callback_group=self.cb_group)
+
+        self.grip_cli = ActionClient(self, SafeGrasp, '/gripper/safe_grasp', callback_group=self.cb_group)
 
         self._wait_for_services()
 
         # 5개 액션 서버 등록 (명세서 3.1)
-        ActionServer(self, ExecuteSolveToken,  'cube_robot_action/execute_solve_token',
+        ActionServer(self, ExecuteSolveToken,  '/robot/execute_solve_token',
                      execute_callback=self._exec_token_cb,  goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, PickupCube,         'cube_robot_action/pickup_cube',
+        ActionServer(self, PickupCube,         '/robot/pickup_cube',
                      execute_callback=self._pickup_cb,      goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, PlaceOnJig,         'cube_robot_action/place_on_jig',
+        ActionServer(self, PlaceOnJig,         '/robot/place_on_jig',
                      execute_callback=self._place_cb,       goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, GoHome,             'cube_robot_action/go_home',
+        ActionServer(self, GoHome,             '/robot/go_home',
                      execute_callback=self._home_cb,        goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
-        ActionServer(self, RotateCubeForFace,  'cube_robot_action/rotate_cube_for_face',
+        ActionServer(self, RotateCubeForFace,  '/robot/rotate_cube_for_face',
                      execute_callback=self._rotate_face_cb, goal_callback=self._goal_cb, cancel_callback=self._cancel_cb, callback_group=self.cb_group)
 
         self._tcp_ready = False
@@ -98,20 +106,42 @@ class RobotActionServerNode(Node):
             (self.movel_cli,   'move_line'), (self.movej_cli, 'move_joint'),
             (self.stop_cli,    'move_stop'), (self.drl_cli,   'drl_start'),
         ]:
-            if not cli.wait_for_service(timeout_sec=5.0):
+            if not cli.wait_for_service(timeout_sec=15.0):
                 self.get_logger().error(f'❌ {name} 없음')
             else:
                 self.get_logger().info(f'✅ {name} 연결됨')
+        if not self.grip_cli.wait_for_server(timeout_sec=15.0):
+            self.get_logger().error('❌ /gripper/safe_grasp 액션 서버 없음')
+        else:
+            self.get_logger().info('✅ /gripper/safe_grasp 연결됨')
 
     def _init_tcp_sync(self):
+        """TCP 등록/활성화. drl_start 안 씀 → 그리퍼의 장기 DRL TCP 서버를 죽이지 않음.
+
+        ConfigCreateTcp(name, pos) → 컨트롤러 TCP 프로파일 등록(덮어쓰기)
+        SetCurrentTcp(name)        → 현재 활성 TCP로 지정
+        GetCurrentTcp()            → 활성 이름 확인용(로깅)
+        """
         self._tcp_timer.cancel()
         try:
-            if self.drl_cli.service_is_ready():
-                req = DrlStart.Request()
-                req.robot_system = 0
-                req.code = f'set_tcp("{TCP_NAME}")'
-                self.drl_cli.call_async(req)
-                self.get_logger().info(f'✅ TCP 설정: {TCP_NAME}')
+            if self.cfg_tcp_cli.service_is_ready():
+                req = ConfigCreateTcp.Request()
+                req.name = TCP_NAME
+                req.pos = [float(v) for v in TCP_POS]
+                self.cfg_tcp_cli.call_async(req)
+                self.get_logger().info(
+                    f'✅ TCP 등록 요청: {TCP_NAME} pos={TCP_POS}'
+                )
+            else:
+                self.get_logger().warn('⚠️ config_create_tcp 서비스 미준비')
+
+            if self.set_tcp_cli.service_is_ready():
+                req2 = SetCurrentTcp.Request()
+                req2.name = TCP_NAME
+                self.set_tcp_cli.call_async(req2)
+                self.get_logger().info(f'✅ TCP 활성화 요청: {TCP_NAME}')
+            else:
+                self.get_logger().warn('⚠️ set_current_tcp 서비스 미준비')
         except Exception as e:
             self.get_logger().warn(f'⚠️ TCP 예외: {e}')
         self._tcp_ready = True
@@ -177,7 +207,10 @@ class RobotActionServerNode(Node):
             return result
 
         self._feedback(gh, 'approach', 0.0)
-        steps = [JOINT_HOME()] + token_sequence(token) + [JOINT_HOME()]
+        # JOINT_HOME wrap 제거 — 토큰 시퀀스 자체가 ZIG_HOME 으로 시작/종료하므로
+        # 매 토큰마다 JOINT_HOME 경유는 불필요한 누적 시간(토큰당 ~3~4s)을 만든다.
+        # 풀이 시작 직전에 orchestrator 가 GoHome 을 1회만 호출해 시작 자세를 normalize 함.
+        steps = token_sequence(token)
         ok = await self._run_sequence(gh, steps)
 
         if ok is None:
@@ -275,7 +308,9 @@ class RobotActionServerNode(Node):
         self.get_logger().info('▶ GoHome')
         result = GoHome.Result()
         self._feedback(gh, 'moving', 0.0)
-        ok = await self._run_sequence(gh, [JOINT_HOME(), ZIG_HOME(), JOINT_HOME()])
+        # JOINT_HOME 한 step 만 — 이전 [JOINT_HOME, ZIG_HOME, JOINT_HOME] 3 step은
+        # 중복(MOVE_L 로 ZIG 갔다가 다시 JOINT_HOME 으로 돌아옴)이라 시간만 늘림.
+        ok = await self._run_sequence(gh, [JOINT_HOME()])
         if ok is None:
             result.success, result.message = False, 'GoHome 취소됨'
         elif not ok:
@@ -339,7 +374,7 @@ class RobotActionServerNode(Node):
             return False
         req = MoveLine.Request()
         req.pos        = [float(p) for p in pos]
-        req.vel        = [step.vel or VEL_X, step.acc or VEL_R]
+        req.vel        = [step.vel or VEL_X, step.vel or VEL_R]
         req.acc        = [step.acc or ACC_X, step.acc or ACC_R]
         req.time       = 0.0
         req.radius     = 0.0
@@ -367,8 +402,25 @@ class RobotActionServerNode(Node):
 
     async def _grip(self, step: Step) -> bool:
         pulse = step.pulse
-        self.get_logger().info(f'  🤖 gripper {"OPEN" if pulse == PULSE_OPEN else "CLOSE"} (pulse={pulse})')
-        time.sleep(0.5)
+        is_open = (pulse == PULSE_OPEN)
+        goal = SafeGrasp.Goal()
+        goal.target_position  = int(pulse)
+        goal.goal_current     = GRIP_GOAL_CURRENT
+        goal.current_threshold = GRIP_THRESHOLD_OPEN if is_open else GRIP_THRESHOLD_CLOSE
+        goal.timeout_sec      = GRIP_TIMEOUT_SEC
+        self.get_logger().info(f'  🤖 gripper {"OPEN" if is_open else "CLOSE"} (pulse={pulse})')
+        gh = await self.grip_cli.send_goal_async(goal)
+        if not gh.accepted:
+            self.get_logger().error('  ❌ gripper goal rejected')
+            return False
+        result_wrap = await gh.get_result_async()
+        res = result_wrap.result
+        if not res.success:
+            self.get_logger().error(f'  ❌ gripper failed: {res.message}')
+            return False
+        self.get_logger().info(
+            f'  ✅ gripper done: pos={res.final_position} cur={res.final_current} grasped={res.grasped}'
+        )
         return True
 
 

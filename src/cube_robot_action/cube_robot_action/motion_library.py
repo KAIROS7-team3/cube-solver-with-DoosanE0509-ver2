@@ -47,21 +47,27 @@ class Step:
 # ═══════════════════════════════════════════════════════════
 # 속도 / 가속도 기본값
 # ═══════════════════════════════════════════════════════════
+# Doosan dsr_msgs2/srv/MoveLine 은 vel=[linear, rotational], acc=[linear, rotational]
+# 두 원소 배열을 받음. MoveJoint 는 단일 vel/acc 스칼라.
+#
+# VEL_X : 직선 이동 속도 (movel translation)        — mm/s
+# VEL_R : 직선 이동 시 회전 속도 (movel orientation) — deg/s
+# ACC_X : 직선 이동 가속도                          — mm/s²
+# ACC_R : 직선 이동 시 회전 가속도                  — deg/s²
+# VEL_J : 관절 회전 속도 (movej)                    — deg/s
+# ACC_J : 관절 회전 가속도 (movej)                  — deg/s²
+#
+# Step 헬퍼(ml_abs, ml_rel, mj_*)에 vel/acc 인자를 명시하지 않으면 아래 기본값이 적용된다.
+# 참고 — DRL 원본(Cube_recognition_process.drl) 속도값:
+#   VEL_X=250.0  VEL_R=76.5  ACC_X=1000.0  ACC_R=306.0  VEL_J=60.0  ACC_J=100.0
+# 실기 안전 마진을 두기 위해 더 보수적인 값을 사용 중 — 필요 시 여기만 조정하면 전체에 반영된다.
 
-VEL_X: float = 20.0
-VEL_R: float = 20.0
-ACC_X: float = 15.0
-ACC_R: float = 15.0
-VEL_J: float = 20.0
-ACC_J: float = 15.0
-
-# DRL 원본 속도 (Cube_recognition_process.drl 기준)
-VEL_X_DRL: float = 250.0
-VEL_R_DRL: float = 76.5
-ACC_X_DRL: float = 1000.0
-ACC_R_DRL: float = 306.0
-VEL_J_DRL: float = 60.0
-ACC_J_DRL: float = 100.0
+VEL_X: float = 35.0
+VEL_R: float = 35.0
+ACC_X: float = 25.0
+ACC_R: float = 25.0
+VEL_J: float = 35.0
+ACC_J: float = 25.0
 
 # ═══════════════════════════════════════════════════════════
 # TCP 설정값
@@ -107,6 +113,7 @@ JOINT_HOME_POS: list = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
 Z_40_DOWN:   list = [0,       0,     -40,    0, 0, 0]
 Z_40_UP:     list = [0,       0,      40,    0, 0, 0]
 Z_30_DOWN:   list = [0,       0,     -30,    0, 0, 0]
+Z_30_UP:     list = [0,       0,      30,    0, 0, 0]
 Z_57_DOWN:   list = [0,       0,    -57.78,  0, 0, 0]
 Z_57_UP:     list = [0,       0,     57.78,  0, 0, 0]
 Z_10_DOWN:   list = [0,       0,     -10,    0, 0, 0]
@@ -235,37 +242,41 @@ def rotate_face_seq(next_face: str) -> list:
       L       → DRL 동작 10: movej J6 -90° (L면 스캔)
       D       → DRL 동작 11~12: movej J6 +270° 복귀 + movel Cube_scan_D (D면 스캔)
       B_AGAIN → DRL 동작 13: movel Cube_scan_B 재이동 (B면 재확인)
+
+    NOTE: B_AGAIN은 오케스트레이터의 자동 스캔 루프에서는 호출되지 않는다.
+          인식 실패 시 사용자가 /robot/rotate_cube_for_face 액션을 직접 호출해
+          수동으로 B면을 다시 캡처할 때만 사용하는 복구 전용 경로다.
     """
     if next_face == 'B':
         # DRL 동작 7: 카메라 앞 Cube_scan_B 위치로 이동
         return [
-            ml_abs(CUBE_SCAN_B, vel=VEL_X_DRL, acc=ACC_X_DRL),
+            ml_abs(CUBE_SCAN_B),
         ]
     elif next_face == 'R':
         # DRL 동작 8: J6 -90° (R면)
         return [
-            mj_rel([0, 0, 0, 0, 0, -90], vel=VEL_J_DRL, acc=ACC_J_DRL),
+            mj_rel([0, 0, 0, 0, 0, -90]),
         ]
     elif next_face == 'F':
         # DRL 동작 9: J6 -90° (F면)
         return [
-            mj_rel([0, 0, 0, 0, 0, -90], vel=VEL_J_DRL, acc=ACC_J_DRL),
+            mj_rel([0, 0, 0, 0, 0, -90]),
         ]
     elif next_face == 'L':
         # DRL 동작 10: J6 -90° (L면)
         return [
-            mj_rel([0, 0, 0, 0, 0, -90], vel=VEL_J_DRL, acc=ACC_J_DRL),
+            mj_rel([0, 0, 0, 0, 0, -90]),
         ]
     elif next_face == 'D':
         # DRL 동작 11~12: J6 +270° 복귀 + Cube_scan_D 이동 (D면)
         return [
-            mj_rel([0, 0, 0, 0, 0, 270], vel=VEL_J_DRL, acc=ACC_J_DRL),
-            ml_abs(CUBE_SCAN_D, vel=VEL_X_DRL, acc=ACC_X_DRL),
+            mj_rel([0, 0, 0, 0, 0, 270]),
+            ml_abs(CUBE_SCAN_D),
         ]
     elif next_face == 'B_AGAIN':
         # DRL 동작 13: Cube_scan_B 재이동 (B면 재확인)
         return [
-            ml_abs(CUBE_SCAN_B, vel=VEL_X_DRL, acc=ACC_X_DRL),
+            ml_abs(CUBE_SCAN_B),
         ]
     else:
         raise ValueError(f'알 수 없는 face: {next_face!r}')
@@ -288,9 +299,16 @@ def place_step_seq(step: str) -> list:
     """
     if step == 'APPROACH':
         # DRL 동작 14~15: ZIG 위치 복귀 + Z -30mm 하강
+        # D면 카메라 자세(CUBE_SCAN_D=[669.3,-47.19,505.71, 160.24,-11.66,-161.00])에서
+        # INITIAL_STATE([373.030,0,74.660, 22.85,-180,22.85])로 바로 MOVE_L 하면
+        # 위치/자세 변화량이 커서 손목 특이점(J5≈0) 또는 엘보 근방을 통과해
+        # 비상정지가 자주 발생함(2026-05-07 실측).
+        # → 먼저 MOVE_J 로 JOINT_HOME 자세로 정렬한 뒤 MOVE_L 로 ZIG 진입.
+        # B/R/F/L 면 인식 후에도 동일하게 Home 경유 — 일관된 안전 패턴.
         return [
-            ml_abs(INITIAL_STATE, vel=VEL_X_DRL, acc=ACC_X_DRL),
-            ml_rel(Z_30_DOWN,     vel=VEL_X_DRL, acc=ACC_X_DRL),
+            mj_abs(JOINT_HOME_POS),
+            ml_abs(INITIAL_STATE),
+            ml_rel(Z_30_DOWN),
         ]
     elif step == 'RELEASE':
         # DRL 동작 16: 그리퍼 개방 (큐브 내려놓기)
@@ -328,21 +346,21 @@ def _u_seq() -> list:
     return [
         GRIP_OPEN(), ZIG_HOME(), ml_rel(Z_30_DOWN),
         GRIP_CUBE(), J6_CW(),
-        GRIP_OPEN(), ml_rel(Z_40_UP), ZIG_HOME(),
+        GRIP_OPEN(), ml_rel(Z_30_UP), ZIG_HOME(),
     ]
 
 def _u_prime_seq() -> list:
     return [
         GRIP_OPEN(), ZIG_HOME(), ml_rel(Z_30_DOWN),
         GRIP_CUBE(), J6_CCW(),
-        GRIP_OPEN(), ml_rel(Z_40_UP), ZIG_HOME(),
+        GRIP_OPEN(), ml_rel(Z_30_UP), ZIG_HOME(),
     ]
 
 def _u2_seq() -> list:
     return [
         GRIP_OPEN(), ZIG_HOME(), ml_rel(Z_30_DOWN),
         GRIP_CUBE(), J6_CW(), J6_CW(),
-        GRIP_OPEN(), ml_rel(Z_40_UP),
+        GRIP_OPEN(), ml_rel(Z_30_UP),
         J6_CCW(), J6_CCW(), ZIG_HOME(),
     ]
 
@@ -514,7 +532,7 @@ def _b2_seq() -> list:
 def _perception_seq() -> list:
     return (
         pickup_from_jig_seq() +
-        [ml_abs(CUBE_SCAN_B, vel=VEL_X_DRL, acc=ACC_X_DRL)] +
+        [ml_abs(CUBE_SCAN_B)] +
         rotate_face_seq('R') + rotate_face_seq('F') + rotate_face_seq('L') +
         rotate_face_seq('D') + rotate_face_seq('B_AGAIN') +
         place_step_seq('APPROACH') + place_step_seq('RELEASE')
@@ -537,6 +555,9 @@ _TOKEN_MAP = {
 
 VALID_TOKENS: list = list(_TOKEN_MAP.keys())
 
+# action server가 받을 수 있는 face name 목록.
+# 자동 스캔(orchestrator) 루프는 'B','R','F','L','D' 5면만 호출한다.
+# 'B_AGAIN'은 인식 실패 시 사용자가 수동으로 호출하는 복구용 face — 자동 시퀀스에서는 호출되지 않음.
 SCAN_FACES: list = ['B', 'R', 'F', 'L', 'D', 'B_AGAIN']
 PICKUP_STEPS: list = ['RELEASE_HOME', 'DESCEND', 'GRIP', 'LIFT']
 PLACE_STEPS: list = ['APPROACH', 'RELEASE']

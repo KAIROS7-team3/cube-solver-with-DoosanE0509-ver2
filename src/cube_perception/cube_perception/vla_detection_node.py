@@ -32,7 +32,7 @@ from .detection.gemini_vla_backend import GeminiVLADetector
 from .detection.opencv_depth_backend import OpenCVDepthDetector
 
 try:
-    from cube_perception.srv import DetectCubePose
+    from cube_interfaces.srv import DetectCubePose
 except ImportError:
     DetectCubePose = None
 
@@ -224,6 +224,9 @@ class VlaDetectionNode(Node):
         if isinstance(top_face_9, str):
             self._latest_top_face_9 = top_face_9
             self._publish_u_face_cache(top_face_9, top_color)
+            self.get_logger().info(
+                f"DetectCubePose U-face: color={top_color}  9stickers={top_face_9}"
+            )
 
         try:
             depth_out = self._depth_backend.compute_from_pixel(
