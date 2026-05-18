@@ -405,6 +405,7 @@ ros2 service call /orchestrator/emergency_stop std_srvs/srv/Trigger "{}"
 
 | 항목 | 내용 |
 |---|---|
+| **큐브 지그(ZIG) 위치 고정** | 지그 기준점 `INITIAL_STATE = [373.030, 0.000, 74.660, 22.85, -180.0, 22.85]` 가 `cube_robot_action/motion_library.py` 에 **base frame 절대 좌표로 하드코딩**되어 있음. 관련 상수(`L_DROP_POS`, `R_DROP_POS`, `READY_D_LOW/UP`, `CUBE_SCAN_B/D`, `WORKSTATION_GRIP_Z=13.71` 등)도 모두 같은 위치를 가정. 지그/카메라/워크스테이션을 물리적으로 옮기면 **코드 수정 + 재빌드 필요**. 향후 yaml 파라미터로 분리 권장. |
 | 그리퍼 전류 임계값 | `GRIP_THRESHOLD_CLOSE=300`mA, `GRIP_THRESHOLD_OPEN=9999` (position-only), `GRIP_GOAL_CURRENT=500`mA, `GRIP_TIMEOUT_SEC=8.0`s — 실기 튜닝 필요 |
 | `face_transition_sequence()` | 미구현 (빈 리스트 반환) — 면 전환 룩업테이블 채우기 필요 |
 | `time.sleep` in async | `_movel`/`_movej` 코루틴 내 `time.sleep(0.3)` → `asyncio.sleep`으로 교체 권장 |
